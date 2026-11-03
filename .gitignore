@@ -1,0 +1,5 @@
+allocate_pro_cloud_token.txt
+ALLOCATE_PRO_CLOUD.json
+update_signing_key.json
+__pycache__/
+*.db
