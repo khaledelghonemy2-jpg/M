@@ -2254,12 +2254,13 @@ def create_user(u,pw,role="manager"):
     finally:
         con.close()
 def verify_user(u,pw):
+    u=(u or "").strip()   # create_user stores names trimmed, so match that on login
     try:
         con=_users_read_connect(); row=con.execute("SELECT salt,pwhash,role FROM users WHERE username=?",(u,)).fetchone(); con.close()
     except Exception:
         return None
     if not row:return None
-    return row[2] if _hash(pw,row[0])==row[1] else None
+    return row[2] if secrets.compare_digest(_hash(pw,row[0]),str(row[1] or "")) else None
 def list_users():
     """Usernames and roles only — live replica read; never exposes password hashes."""
     con=_users_read_connect()
@@ -2369,12 +2370,14 @@ def effective_rate(worker,category,worker_rates=None,week=None,on=None):
     r=get_worker_rate(worker,category)
     return r if r is not None else g[category]
 
-def worker_estimated_hours(remaining_wage,worker=None,worker_rates=None):
+def worker_estimated_hours(remaining_wage,worker=None,worker_rates=None,week=None):
+    """Hours per category this much money still covers. Pass `week` so a week before the
+    rate change is costed at the old rates, exactly as the save will cost it."""
     if worker is None:
-        return {cat: remaining_wage/rate for cat,rate in GLOBAL_RATES.items()}
-    return {cat: remaining_wage/effective_rate(worker,cat,worker_rates) for cat in CATEGORIES}
-def allocation_cost(hours,category,worker=None,worker_rates=None):
-    rate=GLOBAL_RATES[category] if worker is None else effective_rate(worker,category,worker_rates)
+        return {cat: remaining_wage/rate for cat,rate in global_rates_for_week(week).items()}
+    return {cat: remaining_wage/effective_rate(worker,cat,worker_rates,week=week) for cat in CATEGORIES}
+def allocation_cost(hours,category,worker=None,worker_rates=None,week=None):
+    rate=global_rates_for_week(week)[category] if worker is None else effective_rate(worker,category,worker_rates,week=week)
     return hours*rate
 def fmt(x): return f"{x:.2f}"
 
@@ -2895,6 +2898,7 @@ def rename_worker(old_name,new_name):
         c.execute("UPDATE worker_chain SET worker=? WHERE worker=?",(new_name,old_name))
         c.execute("UPDATE worker_rate SET worker=? WHERE worker=?",(new_name,old_name))
         c.execute("UPDATE cmv_week_info SET worker=? WHERE worker=?",(new_name,old_name))
+        c.execute("UPDATE notes SET entity_id=? WHERE entity_type='worker' AND entity_id=?",(new_name,old_name))
         c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_edited',?)",(now,))
         c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_editor_session',?)",(globals().get("TEAM_SESSION_ID","") or "",))
         con.commit()
@@ -2938,6 +2942,7 @@ def rename_client(old_name,new_name):
         c.execute("UPDATE client_estimate SET client=? WHERE client=?",(new_name,old_name))
         c.execute("UPDATE allocations SET client=? WHERE client=?",(new_name,old_name))
         c.execute("UPDATE worker_chain SET client=? WHERE client=?",(new_name,old_name))
+        c.execute("UPDATE notes SET entity_id=? WHERE entity_type='client' AND entity_id=?",(new_name,old_name))
         c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_edited',?)",(now,))
         c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_editor_session',?)",(globals().get("TEAM_SESSION_ID","") or "",))
         con.commit()
@@ -2977,7 +2982,8 @@ def client_estimate_total(client,category):
 
 def client_week_estimate_cost(client,week):
     """Dollar value of a client's ESTIMATED hours for one week (sum over categories)."""
-    return sum(get_client_estimate(client,week,cat)*GLOBAL_RATES[cat] for cat in CATEGORIES)
+    rates=global_rates_for_week(week)
+    return sum(get_client_estimate(client,week,cat)*rates[cat] for cat in CATEGORIES)
 def week_total_estimate_cost(week):
     return sum(client_week_estimate_cost(c,week) for c in list_clients())
 def week_total_wages(week):
@@ -3511,20 +3517,39 @@ def plan_chain_allocation(client, weeks=None):
     # track wage already committed to each worker THIS PLAN, per week, so later
     # categories in the same week correctly see less spare wage than the first.
     committed = {(w,wk):0.0 for w in chain for wk in weeks}
+    # Read everything once instead of one query per week/category/worker.
+    con=read_connect()
+    try:
+        ests={(wk,cat):float(h or 0) for wk,cat,h in con.execute(
+            "SELECT week,category,hours FROM client_estimate WHERE client=?",(client,)).fetchall()}
+        placed={}
+        for wk,cat,h in con.execute("SELECT week,category,COALESCE(SUM(hours),0) FROM allocations WHERE client=? GROUP BY week,category",(client,)).fetchall():
+            placed[(wk,cat)]=float(h or 0)
+        wage_left={}
+        for w,wk,v in con.execute("SELECT worker,week,COALESCE(wage,0) FROM worker_week").fetchall():
+            wage_left[(w,wk)]=float(v or 0)
+        for w,wk,c in con.execute("SELECT worker,week,COALESCE(SUM(cost),0) FROM allocations GROUP BY worker,week").fetchall():
+            wage_left[(w,wk)]=wage_left.get((w,wk),0.0)-float(c or 0)
+        try:
+            wrates={(w,cat):float(r) for w,cat,r in con.execute("SELECT worker,category,rate FROM worker_rate").fetchall()}
+        except sqlite3.OperationalError:
+            wrates={}
+    finally:
+        con.close()
     for wk in weeks:
         for cat in CATEGORIES:
-            est=get_client_estimate(client,wk,cat)
+            est=ests.get((wk,cat),0.0)
             if est<=1e-9: continue
-            already=sum(r[5] for r in allocations_for(wk) if r[3]==client and r[4]==cat)
+            already=placed.get((wk,cat),0.0)
             remaining=est-already
             if remaining<=1e-9: continue
             day = "Saturday" if cat=="Saturday" else ("Sunday" if cat=="Sunday" else "")
             for worker in chain:
                 if remaining<=1e-9: break
-                wage_left = worker_wage_left(worker,wk) - committed[(worker,wk)]
-                if wage_left<=1e-9: continue
-                rate=effective_rate(worker,cat)
-                capacity_hours = wage_left/rate
+                left = wage_left.get((worker,wk),0.0) - committed[(worker,wk)]
+                if left<=1e-9: continue
+                rate=effective_rate(worker,cat,wrates,week=wk)
+                capacity_hours = left/rate
                 take = min(remaining, capacity_hours)
                 if take<=1e-9: continue
                 plan.append((wk,worker,cat,take,day))
@@ -3541,7 +3566,7 @@ def estimate_left_this_week(client,week,category):
 def est_reconcile_dollars(client,week,category):
     """Estimate reconciliation IN DOLLARS for a client/category in a week.
     Returns (estimate$, reconciled$ (placed), left_to_reconcile$)."""
-    rate=GLOBAL_RATES[category]
+    rate=global_rates_for_week(week)[category]
     est=get_client_estimate(client,week,category)*rate
     placed=client_allocated(client,week,category)*rate
     return est, placed, est-placed
@@ -3588,12 +3613,13 @@ def allocation_times_map(week=None):
 
 def add_allocation(week,worker,client,category,hours,day="",note="",user="system"):
     # Only reject genuinely broken input. Over-allocation is ALLOWED and flagged later.
-    if hours is None or hours<=0:
-        raise ValueError("Hours must be a positive number.")
-    rate=effective_rate(worker,category,week=week); cost=hours*rate
-    con=connect();con.execute("""INSERT INTO allocations(week,worker,client,category,hours,rate,cost,day,note,created_by,created)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",(week,worker,client,category,hours,rate,cost,day,note,user,datetime.now().isoformat()))
-    con.commit();aid=con.execute("SELECT last_insert_rowid()").fetchone()[0];con.close();touch_last_edited();return aid
+    # Goes through the atomic save so the estimate, audit log and change marker stay in step.
+    aid=save_allocation_atomic(week,worker,client,category,hours,day,user)
+    if note:
+        con=background_write_connect()
+        try: con.execute("UPDATE allocations SET note=? WHERE id=?",(note,aid)); con.commit()
+        finally: con.close()
+    return aid
 
 def _read_estimate_cell(con, client, week, category):
     """(hours, auto) for one weekly estimate. Periods archived before the `auto` column
@@ -3779,7 +3805,10 @@ def save_allocation_atomic(week,worker,client,category,hours,day="",user="system
     now=datetime.now().isoformat()
     con=background_write_connect()
     try:
+        old_cell=None
         if existing_aid:
+            prev=_fetch_allocation_row(con,existing_aid,"client,week,category")
+            if prev and tuple(prev)!=(client,week,category): old_cell=tuple(prev)
             con.execute("""UPDATE allocations
                 SET category=?,hours=?,rate=?,cost=?,day=?,created_by=?,created=?
                 WHERE id=?""",
@@ -3813,6 +3842,8 @@ def save_allocation_atomic(week,worker,client,category,hours,day="",user="system
                         (client,week,category,float(update_estimate_to)))
         else:
             _sync_estimate_to_allocated(con,client,week,category)
+        if old_cell:
+            _sync_estimate_to_allocated(con,*old_cell)
 
         audit_write("EDIT" if existing_aid else "ADD","allocation",aid,week,"",
                     f"{worker} → {client} · {category} · {hours}h · ${cost:.2f}"
@@ -3995,7 +4026,17 @@ def delete_allocations_batch(aids,user="system"):
     if not aids:return 0
     con=background_write_connect(); now=datetime.now().isoformat(timespec="seconds")
     try:
+        # Remember which (client, week, category) cells lose hours so their app-filled
+        # estimates follow the allocations down — the single delete already does this;
+        # without it a bulk delete left auto estimates frozen at the old, higher total.
+        cells=set()
+        for i in range(0,len(aids),500):
+            chunk=aids[i:i+500]
+            q=",".join("?"*len(chunk))
+            cells.update(con.execute(f"SELECT client,week,category FROM allocations WHERE id IN ({q})",chunk).fetchall())
         con.executemany("DELETE FROM allocations WHERE id=?",[(a,) for a in aids])
+        for c,wk,cat in cells:
+            _sync_estimate_to_allocated(con,c,wk,cat)
         audit_write("DELETE","allocations","batch","","",str(len(aids)),f"{len(aids)} allocations deleted",user,con)
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_edited',?)",(now,))
         con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_editor_session',?)",(globals().get("TEAM_SESSION_ID","") or "",))
@@ -4007,8 +4048,7 @@ def delete_allocations_batch(aids,user="system"):
     finally: con.close()
 
 def delete_allocation(aid):
-    con=connect();con.execute("DELETE FROM allocations WHERE id=?",(aid,));con.commit();con.close()
-    touch_last_edited()
+    delete_allocation_atomic(aid)
 
 def set_allocation_times(aid, start_time="", end_time=""):
     """Attach exact clock-in/clock-out times to an allocation, e.g. from a time-tracking
@@ -4093,14 +4133,9 @@ def edit_allocation(aid,hours,day=None,category=None,user="system"):
         raise ValueError("Hours must be a positive number.")
     use_day = old_day if day is None else day
     use_category = old_category if category is None else category
-    delete_allocation(aid)
-    # add_allocation computes rate/cost fresh from use_category's own rate — a category
-    # change is correctly re-costed here, and correctly moves which client/category
-    # pool it counts against everywhere else (reconciliation, reports, wages).
-    new_aid=add_allocation(week,worker,client,use_category,hours,use_day,note,user)
-    if old_start or old_end:   # carry forward exact clock times — editing hours/day/category must never silently drop them
-        set_allocation_times(new_aid, old_start or "", old_end or "")
-    return new_aid
+    # Edit in place in ONE transaction (re-costed, estimates synced, clock times kept).
+    # The old delete-then-add could lose the allocation if the add failed half way.
+    return edit_allocation_atomic(aid,hours,use_day,use_category,user,old_start or "",old_end or "")
 
 def same_day_clients(worker,week,day):
     if not day: return []
@@ -8730,7 +8765,7 @@ class App:
             paid=self._snapshot["wages"].get((fw,wk_cur),0.0); rec=self._derived["worker_week_alloc"].get((fw,wk_cur),0.0); left=paid-rec
             col=DANGER if left<-0.01 else (WARNING if paid>0 and left<0.1*paid else SUCCESS)
             self.ctx_worker_val.config(text=("-$"+fmt(-left) if left<0 else "$"+fmt(left)),fg=col)
-            cover=worker_estimated_hours(max(0.0,left))
+            cover=worker_estimated_hours(max(0.0,left),fw,self._snapshot.get("worker_rates",{}),week=wk_cur)
             cover_txt=" · ".join(f"{CAT_ABBR[cc]} {fmt(cover[cc])}h" for cc in CATEGORIES)
             self.ctx_worker_sub.config(text=f"{fw} • paid ${fmt(paid)} this week • could still cover: {cover_txt}")
             self.ctx_worker_badge.config(text=("OVER" if left<-0.01 else ("NEAR LIMIT" if paid>0 and left<0.1*paid else "ON TRACK")),fg=col)
@@ -10910,7 +10945,7 @@ class App:
         # cost the plan would add, per week
         add_cost={wk:0.0 for wk in WEEKS}
         for wk,cat,est,day in plan:
-            add_cost[wk]+=allocation_cost(est,cat)
+            add_cost[wk]+=allocation_cost(est,cat,worker,week=wk)
         # projected per-week left = current left - planned cost this week
         proj_week={wk: worker_wage_left(worker,wk)-add_cost[wk] for wk in WEEKS}
         proj_period=sum(proj_week.values())
@@ -12807,13 +12842,13 @@ class App:
             # $ figure on this screen, exactly as the save will.
             wrates=self._snapshot.get("worker_rates",{})
             def rate_for(cat_):
-                return effective_rate(w,cat_,wrates) if w else GLOBAL_RATES.get(cat_,0)
+                return effective_rate(w,cat_,wrates,week=wk) if w else global_rates_for_week(wk).get(cat_,0)
             # Worker KPI
             if w:
                 paid=float(self._snapshot.get("wages",{}).get((w,wk),0.0) or 0.0)
                 wl=float(wage_left.get(w,0.0) or 0.0); rec=paid-wl
                 wage_kpi.set(("-$"+fmt(-wl)) if wl<0 else "$"+fmt(wl))
-                cover=worker_estimated_hours(max(0.0,wl),w,wrates)
+                cover=worker_estimated_hours(max(0.0,wl),w,wrates,week=wk)
                 cover_txt=" · ".join(f"{CAT_ABBR[cc]} {fmt(cover[cc])}h" for cc in CATEGORIES)
                 has_exc=any(k[0]==w for k in wrates)
                 # Name the week explicitly: wages are per week, and this card silently
@@ -12967,7 +13002,7 @@ class App:
 
             existing_aid=None
             final_hours=h
-            start_time=stv.get().strip(); end_time=etv.get().strip()
+            start_time=normalize_time(stv.get().strip()); end_time=normalize_time(etv.get().strip())
             # LOCAL-FIRST UX: update RAM immediately. Turso never owns the click.
             old_row=next((r for r in self._snapshot["allocations"] if existing_aid and str(r[0])==str(existing_aid)),None)
             provisional_id=existing_aid if existing_aid else -int(time.time_ns()%2_000_000_000)-1
@@ -15947,8 +15982,8 @@ class AuditContext:
         return None
     def date_of(self,wk,day):
         return day_date_for(self.week_dates.get(wk),day) if day else None
-    def rate(self,w,cat):
-        try: return effective_rate(w,cat or "Weekday",self.rates)
+    def rate(self,w,cat,on=None):
+        try: return effective_rate(w,cat or "Weekday",self.rates,on=on)
         except Exception: return GLOBAL_RATES.get(cat or "Weekday",GLOBAL_RATES["Weekday"])
     def week_rows(self,wk):
         return [r for r in self.rows if r[1]==wk]
@@ -15991,7 +16026,7 @@ def suggest_add(ctx,clients,d,cat,need,limit=4):
     for w in ctx.snap.get("workers",[]):
         left=ctx.left.get((w,wk),0.0)
         if left<=0.5: continue
-        can=_q(left/max(0.01,ctx.rate(w,cat)))
+        can=_q(left/max(0.01,ctx.rate(w,cat,on=d)))
         if can<0.25: continue
         cmv=[x for c in clients for x in ctx.cmv_on(w,c,d)]
         works=any(r[2]==w and r[3] in clients for r in ctx.week_rows(wk))
