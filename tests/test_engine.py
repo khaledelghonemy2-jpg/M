@@ -5,7 +5,7 @@ sys.path.insert(0,sys.argv[2])
 import ALLOCATE_PRO as ap
 assert not ap.CLOUD_ENABLED, "cloud must be off for tests"
 ap.init_db()
-from ap import *
+from ALLOCATE_PRO import *
 set_week_dates_batch({"Week 1":"2026-09-20","Week 2":"2026-09-27","Week 3":"2026-10-04","Week 4":"2026-10-11","Week 5":"2026-10-18","Week 6":"2026-10-25"})
 add_worker("Ann"); add_client("Bob")
 for wk in WEEKS: set_worker_wage("Ann",wk,1000)
