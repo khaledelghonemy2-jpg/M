@@ -51,4 +51,20 @@ create_user("khaled","pw123")
 assert verify_user(" khaled ","pw123")=="manager" and verify_user("khaled","nope") is None
 print("login ok")
 print("est reconcile W1 $",est_reconcile_dollars("Bobby","Week 1","Weekday")[0])
+# 8. roster: CareMile shifts with no allocation become dashed "ghosts"
+import types
+import ALLOCATE_PRO as _ap
+snap={"clients":["Pine Lodge","Harbour View"],"cmv_info":[
+  (1,"Week 1","Tom","Tom","2026-09-15","Tuesday","Pine Lodge-CO-CM017","care",3,"09:00","12:00","approved"),   # not allocated -> ghost
+  (2,"Week 1","Tom","Tom","2026-09-16","Wednesday","Pine Lodge-CO-CM017","care",2,"09:00","11:00","approved"), # allocated -> none
+  (3,"Week 1","Tom","Tom","2026-09-17","Thursday","Harbour View-CO-CM9","care",6,"08:00","14:00","approved"),  # 4h allocated -> 2h ghost 12-14
+  (4,"Week 1","Tom","Tom","2026-09-18","Friday","Pine Lodge-CO-CM017","care",5,"08:00","13:00","Cancelled"),   # cancelled -> none
+  (5,"Week 2","Tom","Tom","2026-09-22","Tuesday","Pine Lodge-CO-CM017","care",3,"09:00","12:00","approved")]} # other week -> none
+week_rows=[(1,"Week 1","Tom","Pine Lodge","Weekday",2,0,0,"Wednesday","","","","09:00","11:00"),
+           (2,"Week 1","Tom","Harbour View","Weekday",4,0,0,"Thursday","","","","08:00","12:00")]
+fake=types.SimpleNamespace(_snapshot=snap,_week_rows=lambda:week_rows,_CMV_SKIP_STATUS=_ap.App._CMV_SKIP_STATUS)
+g=_ap.App._roster_cmv_ghosts(fake,"Week 1")
+got=sorted((x["day"],x["client"],x["hours"],x["start"],x["end"],x["partial"]) for x in g)
+assert got==[("Thursday","Harbour View",2.0,"12:00","14:00",True),("Tuesday","Pine Lodge",3.0,"09:00","12:00",False)], got
+print("roster CareMile ghosts ok")
 print("ALL TESTS PASSED")

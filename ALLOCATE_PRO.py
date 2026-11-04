@@ -7375,9 +7375,11 @@ class App:
             wrap.pack_forget()
             self.roster_area.pack(fill="both",expand=True,padx=22,pady=(0,12))
             for b in (self.alloc_prev_btn,self.alloc_next_btn,self.alloc_page_lbl): b.pack_forget()
+            if getattr(self,"roster_cmv_btn",None) is not None: self.roster_cmv_btn.pack(side="left",padx=(10,0))
             self.roster_hint.pack(side="right",padx=6)
         else:
             self.roster_area.pack_forget(); self.roster_hint.pack_forget()
+            if getattr(self,"roster_cmv_btn",None) is not None: self.roster_cmv_btn.pack_forget()
             self.alloc_page_lbl.pack(side="right",padx=6); self.alloc_next_btn.pack(side="right",padx=2); self.alloc_prev_btn.pack(side="right",padx=2)
             wrap.pack(fill="both",expand=True,padx=22,pady=(0,12))
         on=PRIMARY; off=CONTROL
@@ -7401,6 +7403,66 @@ class App:
         i=cl.index(client) if client in cl else sum(ord(ch) for ch in str(client))
         return pal[i%len(pal)]
 
+    _ROSTER_HINT="Click empty day = add  ·  dashed = CareMile"
+    _CMV_SKIP_STATUS=("rejected","cancelled","canceled","declined")
+
+    def _roster_cmv_ghosts(self,wk):
+        """CareMile shifts this week that no allocation covers yet.
+
+        CareMile (CMV Week Info) is what was really worked; an allocation is what has been
+        reconciled. Per worker + day + CareMile client, the hours already allocated to a
+        matching app client are used up shift by shift (earliest first); whatever is left
+        uncovered comes back as a 'ghost' the roster draws dashed. Rejected/cancelled
+        sessions are ignored, exactly as the CareMile import ignores them."""
+        clients=list(self._snapshot.get("clients",[]))
+        alloc=[r for r in self._week_rows() if r[8] in _DAY_NAMES]
+        mapped={}
+        def app_client(raw):
+            if raw not in mapped:
+                mapped[raw]=next((c for c in clients if cmv_client_match(raw,c)),None)
+            return mapped[raw]
+        groups={}
+        for x in self._snapshot.get("cmv_info",[]) or []:
+            try:
+                rid,rwk,w,src,wd,day,raw,service,hours,st,et,status=x[:12]
+            except Exception:
+                continue
+            if rwk!=wk or day not in _DAY_NAMES or not w: continue
+            if str(status or "").strip().lower() in self._CMV_SKIP_STATUS: continue
+            try: hours=float(hours or 0)
+            except Exception: hours=0.0
+            if hours<=0.01: continue
+            groups.setdefault((w,day,_norm_name(str(raw).split("-")[0])),[]).append((rid,w,day,raw,hours,st or "",et or ""))
+        ghosts=[]
+        for (w,day,_k),items in groups.items():
+            raw0=items[0][3]
+            mine=[r for r in alloc if r[2]==w and r[8]==day and cmv_client_match(raw0,r[3])]
+            have=sum(float(r[5] or 0) for r in mine)
+            ends=[normalize_time(r[13]) for r in mine if _hhmm(normalize_time(r[13] or "")) is not None]
+            last_end=max(ends,key=_hhmm) if ends else ""
+            items.sort(key=lambda t:(_hhmm(t[5]) if _hhmm(t[5]) is not None else 9999,t[0]))
+            for rid,w_,day_,raw,hours,st,et in items:
+                if have>=hours-0.01:
+                    have-=hours; continue
+                need=round(hours-max(0.0,have),2); partial=have>0.01; have=0.0
+                cat=_CAT_OF_DAY.get(day_,"Weekday")
+                gs,ge=st,et
+                if partial:
+                    # The allocated part already fills the start of the shift, so the rest
+                    # starts where the last matching allocation ends (never on top of it).
+                    gs=last_end
+                    span=hours_between(gs,normalize_time(et)) if (gs and et) else None
+                    ge=normalize_time(et) if (span is not None and abs(span-need)<0.02) else ""
+                ghosts.append({"id":rid,"worker":w_,"day":day_,"raw":raw,"client":app_client(raw),
+                               "hours":need,"start":gs,"end":ge,"category":cat,"partial":partial,
+                               "shift":(f"{st}–{et}" if st and et else (st or ""))})
+        return ghosts
+
+    def _roster_open_add(self,prefill,source):
+        """Open Add Allocation already filled in from the roster."""
+        p=dict(prefill); p["_from"]=source
+        self.alloc_dialog(prefill=p)
+
     def _draw_roster(self,_e=None):
         if not getattr(self,"roster_canvas",None) or not APP_FOLDS.get("roster",False): return
         import tkinter.font as tkfont
@@ -7419,6 +7481,28 @@ class App:
         cols=list(_DAY_NAMES)+(["—"] if noday else [])
         col_w=max(60,(W-name_w-tot_w)/len(cols))
         head_h=ui_px(46); chip_h=ui_px(40); pad=ui_px(4)
+        # The same filters as the list apply to everything drawn here.
+        try:
+            fw=self.alloc_filter_worker.get(); fc=self.alloc_filter_client.get()
+            fcat=self.alloc_filter_category.get(); q=self.alloc_quick_search.get().strip().lower()
+        except Exception:
+            fw=fc=fcat=q=""
+        # CareMile shifts with no allocation yet, drawn dashed (toggle: "CareMile shifts").
+        ghosts=[]
+        if APP_FOLDS.get("roster_cmv",True):
+            try: ghosts=self._roster_cmv_ghosts(wk)
+            except Exception: ghosts=[]
+            def keep(g):
+                if fw and g["worker"]!=fw: return False
+                if fc and g["client"]!=fc: return False
+                if fcat and g["category"]!=fcat: return False
+                if q and q not in f"{g['worker']} {g['raw']} {g['client'] or ''} {g['category']} {g['day']}".lower(): return False
+                return True
+            ghosts=[g for g in ghosts if keep(g)]
+        def gkey(g): return (g["client"] or g["raw"]) if byc else g["worker"]
+        def gother(g): return g["worker"] if byc else (g["client"] or g["raw"])
+        gcells={}
+        for g in ghosts: gcells.setdefault((gkey(g),g["day"]),[]).append(g)
         # overlaps (same worker, same day, crossing times) get a red outline
         spans={}; bad=set()
         for r in rows:
@@ -7439,6 +7523,19 @@ class App:
             key=r[8] if r[8] in _DAY_NAMES else "—"
             cells.setdefault((r[KI],key),[]).append(r)
             if r[KI] not in order: order.append(r[KI])
+        for g in ghosts:
+            if gkey(g) not in order: order.append(gkey(g))
+        # People who were paid (or clients with a plan) this week get a row even before
+        # their first shift, so there is an empty day to click and add to.
+        if not (fcat or q):
+            if byc:
+                extra=[c for c in self._snapshot["clients"] if (not fc or c==fc) and not fw
+                       and sum(self._snapshot["estimates"].get((c,wk,cc),0.0) for cc in CATEGORIES)>0.01]
+            else:
+                extra=[w for w in self._snapshot["workers"] if (not fw or w==fw) and not fc
+                       and self._snapshot["wages"].get((w,wk),0.0)>0.01]
+            for k in extra:
+                if k not in order: order.append(k)
         wl=self._snapshot["clients" if byc else "workers"]; order.sort(key=lambda w:(wl.index(w) if w in wl else 999,w.lower()))
         for k in cells: cells[k].sort(key=lambda r:(_hhmm(r[12]) if _hhmm(r[12]) is not None else 9999,r[0]))
         today=datetime.now().date()
@@ -7461,13 +7558,37 @@ class App:
             if font.measure(text)<=width: return text
             while text and font.measure(text+"…")>width: text=text[:-1]
             return text+"…"
+        hint=lambda t:self.roster_hint.config(text=t)
+        unhint=lambda e:self.roster_hint.config(text=self._ROSTER_HINT)
         for i,w in enumerate(order):
-            n=max(len(cells.get((w,dn),[])) for dn in cols) or 1
+            n=max(len(cells.get((w,dn),[]))+len(gcells.get((w,dn),[])) for dn in cols) or 1
+            gh=sum(g["hours"] for dn in _DAY_NAMES for g in gcells.get((w,dn),[]))
             rh=n*(chip_h+pad)+pad
-            cv.create_rectangle(0,y,W,y+rh,fill=(TREE_ODD if i%2 else TREE_EVEN),outline="")
+            if gh>0.01: rh=max(rh,ui_px(62))
+            base=(TREE_ODD if i%2 else TREE_EVEN)
+            cv.create_rectangle(0,y,W,y+rh,fill=base,outline="")
             for j,dn in enumerate(cols):
-                if dn in ("Saturday","Sunday"):
-                    x=name_w+j*col_w; cv.create_rectangle(x,y,x+col_w,y+rh,fill=_mix_hex(TREE_ODD if i%2 else TREE_EVEN,ACCENT,.05),outline="")
+                x=name_w+j*col_w
+                fillc=_mix_hex(base,ACCENT,.05) if dn in ("Saturday","Sunday") else base
+                if dn not in _DAY_NAMES:
+                    cv.create_rectangle(x,y,x+col_w,y+rh,fill=fillc,outline=""); continue
+                # Each day cell is a click target: click anywhere not on a shift to add one.
+                ctag=f"c{i}_{j}"
+                cv.create_rectangle(x,y,x+col_w,y+rh,fill=fillc,outline="",tags=(ctag,"cell"))
+                pre={"week":wk,"day":dn,"category":_CAT_OF_DAY.get(dn,"Weekday")}
+                pre["client" if byc else "worker"]=w
+                dd=day_date_for(we,dn)
+                label=f"+ Add a shift for {w} on {dn}"+(f" {dd.strftime('%d %b')}" if dd else "")
+                def _enter(e,t=ctag,lab=label,x0=x,y0=y,h0=rh):
+                    hint(lab)
+                    cv.delete("addhint")
+                    # disabled = never "under the mouse", so it can't steal Enter/Leave from the cell
+                    cv.create_text(x0+col_w/2,y0+h0-ui_px(9),text="+ Add",fill=PRIMARY,font=f_chip,tags=("addhint",),state="disabled")
+                def _leave(e):
+                    cv.delete("addhint"); unhint(e)
+                cv.tag_bind(ctag,"<Enter>",_enter)
+                cv.tag_bind(ctag,"<Leave>",_leave)
+                cv.tag_bind(ctag,"<Button-1>",lambda e,p=pre:self._roster_open_add(p,"roster"))
             cv.create_text(12,y+pad+ui_px(10),text=fit(w,f_name,name_w-18),anchor="w",fill=TEXT,font=f_name)
             if byc:
                 est=sum(self._snapshot["estimates"].get((w,wk,cc),0.0) for cc in CATEGORIES)
@@ -7478,7 +7599,8 @@ class App:
             hsum=0.0
             for j,dn in enumerate(cols):
                 x=name_w+j*col_w
-                for k,r in enumerate(cells.get((w,dn),[])):
+                real=cells.get((w,dn),[])
+                for k,r in enumerate(real):
                     aid=r[0]; cl=r[OI]; cat=r[4]; h=float(r[5] or 0); st=r[12]; et=r[13]
                     hsum+=h
                     cy=y+pad+k*(chip_h+pad); col=(self._worker_colour(cl) if byc else self._client_colour(cl)); tag=f"a{aid}"
@@ -7491,9 +7613,26 @@ class App:
                     cv.create_text(x+12,cy+chip_h*0.70,text=fit(t2,f_small,col_w-20),anchor="w",fill=TEXT2,font=f_small,tags=(tag,"chip"))
                     detail=f"{r[2]} → {r[3]} · {CAT_ABBR.get(cat,cat)} · {fmt(h)}h · {dn if dn!='—' else 'no day'} {st or ''}{'–'+et if et else ''}  —  double-click to edit"
                     if aid in bad: detail="⚠ times overlap or disagree with the hours  ·  "+detail
-                    cv.tag_bind(tag,"<Enter>",lambda e,t=detail:self.roster_hint.config(text=t))
-                    cv.tag_bind(tag,"<Leave>",lambda e:self.roster_hint.config(text="Double-click a shift to edit it"))
+                    cv.tag_bind(tag,"<Enter>",lambda e,t=detail:hint(t))
+                    cv.tag_bind(tag,"<Leave>",unhint)
                     cv.tag_bind(tag,"<Double-1>",lambda e,a=aid:self.edit_alloc(a,extra_refresh=lambda:self._refresh_current_route()))
+                # CareMile shifts with nothing allocated against them: dashed, click to allocate.
+                for k,g in enumerate(gcells.get((w,dn),[]),start=len(real)):
+                    cy=y+pad+k*(chip_h+pad); tag=f"g{g['id']}_{k}"
+                    cv.create_rectangle(x+3,cy,x+col_w-3,cy+chip_h,fill=CARD,outline=TEXT2,dash=(4,3),width=1,tags=(tag,"ghost"))
+                    t1=(f"{g['start']}–{g['end']}" if g["start"] and g["end"] else (f"from {g['start']}" if g["start"] else "no time"))+"  CareMile"
+                    t2=f"{fmt(g['hours'])}h · {gother(g)}"
+                    cv.create_text(x+8,cy+chip_h*0.30,text=fit(t1,f_chip,col_w-16),anchor="w",fill=CYAN,font=f_chip,tags=(tag,"ghost"))
+                    cv.create_text(x+8,cy+chip_h*0.70,text=fit(t2,f_small,col_w-16),anchor="w",fill=TEXT2,font=f_small,tags=(tag,"ghost"))
+                    who=f"{g['worker']} → {g['client'] or g['raw']}"
+                    note=("" if g["client"] else f"  ·  '{g['raw']}' isn't one of your clients yet — pick the client in the form")
+                    part=(f" (rest of the {g['shift']} shift — part is already allocated)" if g["partial"] else "")
+                    detail=f"CareMile: {who} · {dn} {g['shift']} · {fmt(g['hours'])}h not allocated{part}  —  click to allocate{note}"
+                    pre={"week":wk,"worker":g["worker"],"client":g["client"] or "","category":g["category"],"day":dn,
+                         "start":g["start"],"end":g["end"],"hours":g["hours"]}
+                    cv.tag_bind(tag,"<Enter>",lambda e,t=detail:hint(t))
+                    cv.tag_bind(tag,"<Leave>",unhint)
+                    cv.tag_bind(tag,"<Button-1>",lambda e,p=pre:self._roster_open_add(p,"CareMile"))
             tx=W-tot_w+10
             cv.create_text(tx,y+pad+ui_px(10),text=f"{fmt(hsum)}h",anchor="w",fill=TEXT,font=f_name)
             if byc:
@@ -7504,6 +7643,8 @@ class App:
                 left=paid-self._derived["worker_week_alloc"].get((w,wk),0.0)
                 cv.create_text(tx,y+pad+ui_px(28),text=("-$"+fmt(-left)) if left<0 else "$"+fmt(left),anchor="w",
                                fill=(DANGER if left<-0.01 else (SUCCESS if abs(left)<0.01 and paid>0 else WARNING)),font=f_small)
+            if gh>0.01:
+                cv.create_text(tx,y+pad+ui_px(44),text=f"{fmt(gh)}h in CareMile",anchor="w",fill=CYAN,font=f_small)
             y+=rh
         # day totals along the bottom
         th=ui_px(30)
@@ -7520,6 +7661,13 @@ class App:
             x=name_w+j*col_w; cv.create_line(x,0,x,y,fill=_mix_hex(BG_SOFT,BORDER,.8))
         cv.create_line(W-tot_w,0,W-tot_w,y,fill=_mix_hex(BG_SOFT,BORDER,.8))
         cv.configure(height=y+2)
+        n_g=len(ghosts)
+        if hasattr(self,"roster_cmv_btn"):
+            self.roster_cmv_btn.config(text=(f"☑ CareMile shifts · {n_g} to allocate" if APP_FOLDS.get("roster_cmv",True) else "☐ CareMile shifts"))
+
+    def _toggle_roster_cmv(self):
+        APP_FOLDS["roster_cmv"]=not APP_FOLDS.get("roster_cmv",True)
+        _save_appearance(); self._draw_roster()
 
     # ---------------- keyboard ----------------
     SHORTCUTS=[
@@ -8100,7 +8248,11 @@ class App:
                      activebackground=CONTROL_HOVER,activeforeground=TEXT)
         xb.pack(side="left",padx=(10,0))
         Tooltip(xb,"Excel of exactly what you see — this week and your filters")
-        self.roster_hint=tk.Label(strip,text="Double-click a shift to edit it",fg=TEXT2,bg=BG_DARK,font=("Segoe UI",ui_pt(8)))
+        self.roster_cmv_btn=tk.Button(strip,text="☑ CareMile shifts",command=self._toggle_roster_cmv,bg=CONTROL,fg=CYAN,relief="flat",bd=0,
+                                      cursor="hand2",font=("Segoe UI Semibold",ui_pt(8),"bold"),padx=10,pady=2,highlightthickness=0,
+                                      activebackground=CONTROL_HOVER,activeforeground=TEXT)
+        Tooltip(self.roster_cmv_btn,"Show CareMile shifts that have no allocation yet as dashed blocks — click one to allocate it")
+        self.roster_hint=tk.Label(strip,text=self._ROSTER_HINT,fg=TEXT2,bg=BG_DARK,font=("Segoe UI",ui_pt(8)))
         self.alloc_page_lbl=tk.Label(strip,text="",fg=TEXT2,bg=BG_DARK,font=("Segoe UI",9)); self.alloc_page_lbl.pack(side="right",padx=6)
         self.alloc_next_btn=tk.Button(strip,text="›",command=lambda:self._alloc_page_move(1),bg=BG_LIGHT,fg=TEXT,relief="flat",bd=0,width=3,cursor="hand2")
         self.alloc_next_btn.pack(side="right",padx=2)
@@ -13061,7 +13213,8 @@ class App:
                     if p.get("end"): etv.set(normalize_time(p["end"]))
                     elif p.get("hours") not in (None,""): hv.set(fmt_h(float(p["hours"])).rstrip("h"))
                     recompute()
-                    flag.config(text="Filled in from the Audit — check it, then Save",fg=CYAN)
+                    src={"roster":"the roster","CareMile":"the CareMile shift"}.get(p.get("_from"),"the Audit")
+                    flag.config(text=f"Filled in from {src} — check it, then Save",fg=CYAN)
                     he.focus_set(); he.icursor("end")
                 except Exception:
                     pass
