@@ -76,4 +76,13 @@ assert R("Havva Cokacar-CO-CM025",cl)=="Hava"
 assert R("Sarah Smith-CO-CM1",cl) is None          # two Sarahs: never guess
 assert R("Nobody Here-CO-CM9",cl) is None
 print("CareMile client resolving ok")
+# 10. Client guide: formulas from the guide sheet, weekly hours and profit at its rates
+P=_ap._guide_parse_hours
+assert P("=8.5*((5*4)+2)",187)==(8.5,5.0) and P("=8*4",32)==(8.0,1.0) and P("=(6*(3*4))-4.5",67.5)==(6.0,3.0) and P("=SUM(G4:G8)",1)==(None,None)
+g={"cats":{"Weekday":{"per_day":8.5,"days_week":5,"month":187},"Saturday":{"per_day":8,"days_week":1,"month":32},
+           "Sunday":{"per_day":8,"days_week":1,"month":32},"Public Holiday":{"month":0}},"discount":1,"budget_month":19000}
+assert _ap.guide_week_hours(g,"Weekday")==42.5
+m=_ap.guide_money(g,"Week 1")      # Week 1 ends 20 Sep 2026 -> old rates, like the guide sheet
+assert abs(m["cost"]-12096.82)<0.01 and abs(m["invoice"]-20122.33)<0.01 and abs(m["markup"]-66.34)<0.01, m
+print("client guide maths ok")
 print("ALL TESTS PASSED")

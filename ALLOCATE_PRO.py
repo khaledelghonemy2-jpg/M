@@ -1027,6 +1027,7 @@ def init_db():
         id INTEGER PRIMARY KEY, entity_type TEXT, entity_id TEXT, week TEXT,
         note TEXT, author TEXT, created TEXT
     )""")
+    c.execute("CREATE TABLE IF NOT EXISTS client_guide(client TEXT PRIMARY KEY, data TEXT, updated TEXT, updated_by TEXT)")
     con.commit(); con.close()
 
 
@@ -5815,6 +5816,192 @@ class App:
         tk.Button(bar,text="↶ Undo it",command=lambda:(close(),self.remove_auto_dialog(source="Monday auto-import",only_last=True)),
                   bg=CONTROL,fg=TEXT,relief="flat",bd=0,cursor="hand2",padx=10,pady=3).pack(side="right",padx=4,pady=4)
 
+    # ---------------- Client guide (hours pattern, profit, budget) ----------------
+    def guide_dialog(self):
+        self._guide_cache=None
+        d,body=branded_dialog(self.root,"Client guide",
+            "Each client's usual hours (from your guide sheet) against what is allocated, with worker cost, invoice value, profit and budget. "
+            "A month counts as 4 weeks, as in the guide sheet.",1240,760)
+        wk=self.cur_week.get()
+        top=tk.Frame(body,bg=BG_DARK); top.pack(fill="x",padx=16,pady=(10,4))
+        title=tk.Label(top,text="",fg=TEXT,bg=BG_DARK,font=FONTB); title.pack(side="left")
+        btns=tk.Frame(body,bg=BG_DARK); btns.pack(fill="x",padx=16,pady=(2,6))
+        # totals sit at the bottom of the window, so the table can never push them out of view
+        foot=tk.Label(body,text="",fg=TEXT,bg=BG_DARK,font=("Segoe UI",ui_pt(9)),justify="left",anchor="w",wraplength=1180)
+        foot.pack(side="bottom",fill="x",padx=18,pady=(4,10))
+        tree=make_fast_tree(body,("client","gwk","awk","dwk","gmo","amo","cost","inv","profit","markup","budget"),
+                            ("Client","Guide/wk","Done/wk","± week","Guide/mo","Done/mo","Cost/mo","Invoice/mo",
+                             "Profit/mo","Profit %","Budget/mo"),
+                            (150,90,90,100,90,90,115,115,115,85,130),("w","e","e","e","e","e","e","e","e","e","e"),height=10)
+        state={"rows":[]}
+        def money(v): return ("−$" if v<0 else "$")+fmt(abs(v))
+        def draw():
+            self._guide_cache=None
+            st=guide_status(self._snapshot,self._derived,wk); state["rows"]=st
+            try: self._refresh_dashboard()
+            except Exception: pass
+            mon=st[0]["month_label"] if st else ""
+            title.config(text=f"{week_label_short(wk)}  ·  month: {mon or '—'}" if st else "No client guide yet — import your guide workbook to start.")
+            rows=[]
+            for i,r in enumerate(st):
+                g=r["guide"]; m=r["money"]
+                gw=sum(r["week_guide"].values()); aw=sum(r["week_alloc"].values())
+                gm=sum(r["month_guide"].values()); am=sum(r["month_alloc"].values())
+                diff=aw-gw
+                bud=m["budget"]; over_budget=bud>0 and m["invoice"]>bud+0.5
+                tag=("danger" if diff<-0.01 else ("warning" if diff>0.01 else ("odd" if i%2 else "even")))
+                rows.append((r["client"],(r["client"],fmt(gw),fmt(aw),(("+" if diff>0 else "")+fmt(diff)) if abs(diff)>0.009 else "✓ on guide",
+                             fmt(gm),fmt(am),money(m["cost"]),money(m["invoice"]),money(m["margin"]),f"{m['markup']:.1f}%",
+                             (money(bud)+(" ⚠ over" if over_budget else "")) if bud else "—"),(tag,)))
+            self._tree_replace(tree,rows)
+            if st:
+                tc=sum(r["money"]["cost"] for r in st); ti=sum(r["money"]["invoice"] for r in st); tp=ti-tc
+                ac=sum(r["act_cost"] for r in st); ai=sum(r["act_invoice"] for r in st)
+                under=[f"{r['client']} {fmt(-sum(r['week_alloc'].values())+sum(r['week_guide'].values()))}h" for r in st
+                       if sum(r["week_alloc"].values())<sum(r["week_guide"].values())-0.01]
+                foot.config(text=f"Guide per month: worker cost {money(tc)} · invoice {money(ti)} · profit {money(tp)} "
+                                 f"({(tp/tc*100 if tc else 0):.1f}% on cost, {(tp/ti*100 if ti else 0):.1f}% of invoice)\n"
+                                 f"So far in {st[0]['month_label']} (allocated): cost {money(ac)} · invoice {money(ai)} · profit {money(ai-ac)}"
+                                 +(f"\nUnder guide this week: "+", ".join(under) if under else "\nEvery guide client is on or above guide this week."))
+            else: foot.config(text="")
+        def selected():
+            sel=tree.focus()
+            return next((r for r in state["rows"] if r["client"]==sel),None)
+        def do_import():
+            path=filedialog.askopenfilename(parent=d,filetypes=[("Excel files","*.xlsx"),("All files","*.*")])
+            if not path: return
+            def work(): return parse_client_guide_workbook(path)
+            self._run_off_ui(work,lambda res:self._guide_import_preview(d,res,path,after=draw),
+                             lambda exc:messagebox.showerror("Couldn't read the guide",str(exc),parent=d))
+        def do_edit():
+            r=selected()
+            if not r: messagebox.showinfo("Pick a client","Click a client in the table first.",parent=d); return
+            self._guide_edit(d,r["client"],r["guide"],after=draw)
+        def do_remove():
+            r=selected()
+            if not r: messagebox.showinfo("Pick a client","Click a client in the table first.",parent=d); return
+            if not messagebox.askyesno("Remove guide",f"Remove the guide for {r['client']}? (Its allocations and plans stay.)",parent=d): return
+            self._background_job(lambda:save_client_guides({r["client"]:None},self.user),lambda _x=None:draw(),
+                                 lambda exc:messagebox.showerror("Couldn't remove",str(exc),parent=d),label="guide_remove")
+        def do_plans():
+            guides={r["client"]:r["guide"] for r in state["rows"]}
+            if not guides: return
+            self._guide_apply_plans(d,guides)
+        for txt,cmd,col in [("⤒ Import guide workbook…",do_import,PRIMARY),("✎ Edit…",do_edit,CONTROL),("Use as weekly plans…",do_plans,SECONDARY),
+                            ("Remove",do_remove,CONTROL)]:
+            mkbtn(btns,txt,cmd,col,fg=("#fff" if col in (PRIMARY,SECONDARY) else TEXT)).pack(side="left",padx=(0,8))
+        tree.bind("<Double-1>",lambda e:do_edit())
+        draw()
+
+    def _guide_import_preview(self,parent,res,path,after=None):
+        rows=res.get("rows",[])
+        if not rows:
+            messagebox.showwarning("No guide found","No sheet with 'WD  SAT  SUN  PH' columns was found in that workbook.",parent=parent); return
+        clients=list(self._snapshot.get("clients",[])); workers=list(self._snapshot.get("workers",[]))
+        matched=guide_match_rows(rows,clients,workers)
+        d,body=branded_dialog(parent,"Import client guide",f"{os.path.basename(path)} · sheet '{res.get('sheet')}' — the file is only read, never changed.",960,560)
+        grid=tk.Frame(body,bg=BG_DARK); grid.pack(fill="both",expand=True,padx=16,pady=10)
+        heads=["In the guide","App client","Weekday h/wk","Sat","Sun","PH","Budget/mo"]
+        for j,h in enumerate(heads): tk.Label(grid,text=h,fg=TEXT2,bg=BG_DARK,font=("Segoe UI Semibold",8,"bold"),anchor="w").grid(row=0,column=j,sticky="w",padx=4,pady=(0,4))
+        picks=[]
+        for i,r in enumerate(matched,start=1):
+            tk.Label(grid,text=r["name"],fg=TEXT,bg=BG_DARK,font=FONTB,anchor="w").grid(row=i,column=0,sticky="w",padx=4,pady=2)
+            v=tk.StringVar(value=r["client"] or "")
+            ttk.Combobox(grid,textvariable=v,values=[""]+clients,state="readonly",width=20,style="Modern.TCombobox").grid(row=i,column=1,sticky="w",padx=4)
+            for k,cat in enumerate(CATEGORIES):
+                tk.Label(grid,text=fmt(guide_week_hours(r,cat)),fg=TEXT,bg=BG_DARK,font=FONT).grid(row=i,column=2+k,sticky="e",padx=4)
+            tk.Label(grid,text=("$"+fmt(r["budget_month"])) if r.get("budget_month") else "—",fg=TEXT,bg=BG_DARK,font=FONT).grid(row=i,column=6,sticky="e",padx=4)
+            picks.append((r,v))
+        note=tk.Label(body,text="Rows with no app client picked are skipped. Pick the client by hand where the name didn't match.",fg=TEXT2,bg=BG_DARK,font=FONT)
+        note.pack(anchor="w",padx=18)
+        def save():
+            guides={}
+            for r,v in picks:
+                c=v.get().strip()
+                if not c: continue
+                guides[c]={"cats":r["cats"],"workers":[m or w for w,m in r["worker_matches"]],"discount":r["discount"],
+                           "budget_month":r.get("budget_month"),"source":os.path.basename(path),"guide_name":r["name"]}
+            if not guides: messagebox.showwarning("Nothing to save","Pick at least one app client.",parent=d); return
+            def done(_x=None):
+                d.destroy()
+                if after: after()
+            self._background_job(lambda:save_client_guides(guides,self.user),done,lambda exc:messagebox.showerror("Couldn't save",str(exc),parent=d),label="guide_import")
+        mkbtn(body,f"Save guide",save,PRIMARY).pack(side="bottom",pady=10)
+
+    def _guide_edit(self,parent,client,g,after=None):
+        d,body=branded_dialog(parent,f"Guide · {client}","Hours per day × days per week, as in the guide sheet. Month = that × 4 unless you type a month.",620,480)
+        g=json.loads(json.dumps(g or {})); cats=g.setdefault("cats",{})
+        form=tk.Frame(body,bg=BG_DARK); form.pack(fill="x",padx=16,pady=10)
+        for j,h in enumerate(["","Hours per day","Days per week","Hours per month"]):
+            tk.Label(form,text=h,fg=TEXT2,bg=BG_DARK,font=("Segoe UI Semibold",8,"bold")).grid(row=0,column=j,sticky="w",padx=6)
+        vars_={}
+        for i,cat in enumerate(CATEGORIES,start=1):
+            c=cats.get(cat,{})
+            tk.Label(form,text=cat,fg=TEXT,bg=BG_DARK,font=FONTB).grid(row=i,column=0,sticky="w",padx=6,pady=3)
+            vs=[tk.StringVar(value=("" if c.get(k) is None else fmt(float(c.get(k))).rstrip("0").rstrip("."))) for k in ("per_day","days_week","month")]
+            for j,v in enumerate(vs): tk.Entry(form,textvariable=v,width=10,bg=BG_LIGHT,fg=TEXT,insertbackground=TEXT,relief="flat",font=FONT).grid(row=i,column=1+j,padx=6,ipady=3)
+            vars_[cat]=vs
+        r=len(CATEGORIES)+1
+        budv=tk.StringVar(value=("" if not g.get("budget_month") else fmt(float(g["budget_month"]))))
+        discv=tk.StringVar(value=fmt(float(g.get("discount",1) or 0)))
+        for k,(lab,v) in enumerate([("Budget per month ($)",budv),("Invoice discount ($ off the NDIS price)",discv)]):
+            tk.Label(form,text=lab,fg=TEXT,bg=BG_DARK,font=FONT).grid(row=r+k,column=0,sticky="w",padx=6,pady=4)
+            tk.Entry(form,textvariable=v,width=(40 if k==2 else 12),bg=BG_LIGHT,fg=TEXT,insertbackground=TEXT,relief="flat",font=FONT).grid(row=r+k,column=1,columnspan=3,sticky="w",padx=6,ipady=3)
+        def num(t):
+            t=str(t).strip()
+            return float(t) if t else None
+        def save():
+            try:
+                for cat,(pd,dw,mo) in vars_.items():
+                    pdv,dwv,mov=num(pd.get()),num(dw.get()),num(mo.get())
+                    if mov is None: mov=(pdv*dwv*GUIDE_WEEKS_PER_MONTH) if (pdv is not None and dwv is not None) else 0.0
+                    cats[cat]={"per_day":pdv,"days_week":dwv,"month":mov,"formula":""}
+                g["budget_month"]=num(budv.get()); g["discount"]=num(discv.get()) or 0.0
+            except ValueError:
+                messagebox.showerror("Not a number","Type numbers only, e.g. 4.5",parent=d); return
+            def done(_x=None):
+                d.destroy()
+                if after: after()
+            self._background_job(lambda:save_client_guides({client:g},self.user),done,lambda exc:messagebox.showerror("Couldn't save",str(exc),parent=d),label="guide_edit")
+        mkbtn(body,"Save",save,PRIMARY).pack(side="bottom",pady=10)
+
+    def _guide_apply_plans(self,parent,guides):
+        snap=self._snapshot; est=snap.get("estimates",{}) or {}; auto=snap.get("est_auto",set()) or set()
+        rows=guide_weekly_plans(guides)
+        typed=[(c,wk,cat,h) for c,wk,cat,h in rows if float(est.get((c,wk,cat),0) or 0)>0.001 and (c,wk,cat) not in auto
+               and abs(float(est.get((c,wk,cat),0))-h)>0.009]
+        typed_keys={(a,b,k) for a,b,k,_ in typed}
+        # Also lock in plans the app filled from allocations that already equal the guide:
+        # left as "app-filled" they would keep following the allocations instead of the guide.
+        fill=[(c,wk,cat,h) for c,wk,cat,h in rows if (c,wk,cat) not in typed_keys
+              and (abs(float(est.get((c,wk,cat),0) or 0)-h)>0.009 or ((c,wk,cat) in auto and h>0.009))]
+        msg=(f"Set the weekly plans of {len(guides)} client(s) for all 6 weeks from the guide?\n\n"
+             f"{len(fill)} plan(s) will be filled in."
+             +(f"\n{len(typed)} plan(s) someone typed by hand are different from the guide — press YES to keep those, "
+               "NO to replace them with the guide too." if typed else ""))
+        if typed:
+            ans=messagebox.askyesnocancel("Use guide as weekly plans",msg,parent=parent)
+            if ans is None: return
+            todo=fill if ans else fill+typed
+        else:
+            if not messagebox.askyesno("Use guide as weekly plans",msg,parent=parent): return
+            todo=fill
+        if not todo: messagebox.showinfo("Nothing to change","The weekly plans already match the guide.",parent=parent); return
+        def work():
+            con=background_write_connect()
+            try:
+                _multi_upsert(con,"client_estimate",("client","week","category","hours","auto"),("client","week","category"),("hours","auto"),
+                              [(c,wk,cat,h,0) for c,wk,cat,h in todo])
+                audit_write("EDIT","client estimates","guide","",str(len(todo)),str(len(todo)),f"{len(todo)} weekly plan(s) set from the client guide",self.user,con)
+                # The one-time 'which estimates did the app fill' repair must never run after this
+                # and mistake a guide plan that equals the allocations for an app-filled one.
+                con.execute("INSERT OR IGNORE INTO meta(k,v) VALUES(?,?)",(ESTIMATE_AUTO_SEED_FLAG,datetime.now().isoformat(timespec="seconds")))
+                con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('last_edited',?)",(datetime.now().isoformat(timespec="seconds"),))
+                con.commit(); return len(todo)
+            finally: con.close()
+        self._background_job(work,lambda n:(self.refresh(),messagebox.showinfo("Plans set",f"{n} weekly plan(s) set from the guide.",parent=parent)),
+                             lambda exc:messagebox.showerror("Couldn't save",str(exc),parent=parent),sync_after=True,label="guide_plans")
+
     def _update_restart(self):
         L=_ap_launcher()
         if L is None: return
@@ -8074,8 +8261,16 @@ class App:
     def _build_kpis(self,parent):
         row=tk.Frame(parent,bg=BG_DARK); row.pack(fill="x")
         self.kpi_vars={}; self.kpi_subvars={}
-        for title,col in [("Paid to Workers",SECONDARY),("Reconciled",SUCCESS),("Remaining to Reconcile",WARNING),("Client Hours Remaining",CYAN)]:
-            card,var,lbl=self._card(row,title,col); card.pack(side="left",fill="x",expand=True,padx=(0,0 if title=="Client Hours Remaining" else 8)); self.kpi_vars[title]=(var,lbl); self.kpi_subvars[title]=card._subvar
+        self.kpi_cards={}
+        for title,col in [("Paid to Workers",SECONDARY),("Reconciled",SUCCESS),("Remaining to Reconcile",WARNING),("Client Hours Remaining",CYAN),("Profit This Month",PRIMARY)]:
+            card,var,lbl=self._card(row,title,col); self.kpi_vars[title]=(var,lbl); self.kpi_subvars[title]=card._subvar; self.kpi_cards[title]=card
+            # The 4th slot shows Profit once a client guide exists, otherwise client hours.
+            if title!="Profit This Month": card.pack(side="left",fill="x",expand=True,padx=(0,0 if title=="Client Hours Remaining" else 8))
+            if title=="Profit This Month":
+                def _open_guide(_e=None): self.guide_dialog()
+                for w in [card]+list(card.winfo_children()):
+                    try: w.bind("<Button-1>",_open_guide,add="+"); w.config(cursor="hand2")
+                    except Exception: pass
 
     def _fold_section(self,parent,key,title):
         """A dashboard section with a clickable title bar. Folded, it keeps a one-line
@@ -8490,6 +8685,7 @@ class App:
         top=tk.Frame(host,bg=BG_DARK); top.pack(fill="x",padx=22,pady=(0,8))
         tk.Label(top,text="Each cell: allocated this week / remaining across the 6-week estimate",fg=TEXT2,bg=BG_DARK,font=("Segoe UI",9)).pack(side="left")
         mkbtn(top,"Manage Clients",self.clients_dialog,BG_LIGHT,TEXT).pack(side="right")
+        mkbtn(top,"📊 Client guide",self.guide_dialog,PRIMARY).pack(side="right",padx=(0,8))
         mkbtn(top,"＋ From saved clients",lambda:self.add_saved_clients_dialog(),SECONDARY).pack(side="right",padx=(0,8))
         mkbtn(top,"− Remove clients",lambda:self.remove_clients_dialog(),BG_LIGHT,DANGER).pack(side="right",padx=(0,8))
         self.clients_tree=make_fast_tree(host,("client","wd","sat","sun","ph"),("Client","WD","SAT","SUN","PH"),
@@ -8931,6 +9127,18 @@ class App:
         except Exception:
             pass
 
+    def _guide_status_cached(self,max_age=60):
+        """Client-guide status for the selected week; the guide itself is re-read from the
+        database at most once a minute (it changes rarely), the numbers every refresh."""
+        now=time.monotonic(); c=getattr(self,"_guide_cache",None)
+        if c is None or now-c[0]>max_age:
+            try: c=(now,load_client_guides())
+            except Exception: c=(now,{})
+            self._guide_cache=c
+        if not c[1]: return []
+        try: return guide_status(self._snapshot,self._derived,self.cur_week.get(),c[1])
+        except Exception: return []
+
     def _update_kpis(self):
         # Dashboard headline numbers are always the full 6-week period — no "this week"
         # framing here at all, since that requires knowing which week is currently
@@ -8951,6 +9159,23 @@ class App:
             self.kpi_subvars["Reconciled"].set("Across all 6 weeks")
             self.kpi_subvars["Remaining to Reconcile"].set("Across all 6 weeks")
             self.kpi_subvars["Client Hours Remaining"].set(f"6-week estimate: {fmt(estimate_total)}h")
+            # Profit (client guide): what this month's allocations invoice minus what they cost.
+            st=self._guide_status_cached()
+            cards=getattr(self,"kpi_cards",{})
+            if "Profit This Month" in cards and "Client Hours Remaining" in cards:
+                show,hide=(("Profit This Month","Client Hours Remaining") if st else ("Client Hours Remaining","Profit This Month"))
+                if not cards[show].winfo_ismapped():
+                    cards[hide].pack_forget(); cards[show].pack(side="left",fill="x",expand=True,padx=(0,0))
+            if "Profit This Month" in self.kpi_vars:
+                if st:
+                    ac=sum(r["act_cost"] for r in st); ai=sum(r["act_invoice"] for r in st); ap_=ai-ac
+                    gp=sum(r["money"]["margin"] for r in st); gc=sum(r["money"]["cost"] for r in st)
+                    self.kpi_vars["Profit This Month"][0].set(("-$" if ap_<0 else "$")+fmt(abs(ap_)))
+                    self.kpi_vars["Profit This Month"][1].config(fg=(DANGER if ap_<0 else SUCCESS))
+                    self.kpi_subvars["Profit This Month"].set(f"{st[0]['month_label']} so far · {(ap_/ac*100 if ac else 0):.0f}% on cost · guide ${fmt(gp)}/mo ({(gp/gc*100 if gc else 0):.0f}%)")
+                else:
+                    self.kpi_vars["Profit This Month"][0].set("—")
+                    self.kpi_subvars["Profit This Month"].set("Click to set up the Client guide")
 
     def _navigate(self,route,publish=True):
         if route not in self.pages: return
@@ -9308,6 +9533,15 @@ class App:
                 used=self._derived["client_period_alloc"].get((c,cat),0.0); left=total-used
                 if left<-0.01: out.append(("!",f"{c} • {CAT_ABBR.get(cat,cat)}",f"6-week estimate exceeded by {fmt(-left)}h."))
                 elif total>0 and 0<=left<=max(1.0,total*0.1): out.append(("·",f"{c} • {CAT_ABBR.get(cat,cat)}",f"Only {fmt(left)}h remains in the 6-week estimate."))
+        for r in self._guide_status_cached():
+            wk=self.cur_week.get()
+            for cat in CATEGORIES:
+                g_=r["week_guide"][cat]; a_=r["week_alloc"][cat]
+                if g_>0.009 and a_<g_-0.01: out.append(("·",f"{r['client']} • {CAT_ABBR.get(cat,cat)} • guide",f"{fmt(g_-a_)}h under the client guide in {wk} ({fmt(a_)} of {fmt(g_)}h)."))
+                elif a_>g_+0.01 and (g_>0.009 or cat!="Public Holiday"): out.append(("!",f"{r['client']} • {CAT_ABBR.get(cat,cat)} • guide",f"{fmt(a_-g_)}h over the client guide in {wk} ({fmt(a_)} of {fmt(g_)}h)."))
+            m=r["money"]
+            if m["budget"]>0 and m["invoice"]>m["budget"]+0.5:
+                out.append(("!",f"{r['client']} • budget",f"Guide invoices ${fmt(m['invoice'])}/month, above the ${fmt(m['budget'])} monthly budget."))
         if not out: out=[("✓","All clear","No reconciliation issues need attention right now.")]
         return out
 
@@ -9637,7 +9871,7 @@ class App:
         grid=tk.Frame(body,bg=BG_DARK); grid.pack(fill="both",expand=True,padx=20,pady=18)
         items=[("Import Payroll",self.payroll_import_dialog),("Import Shift CSV",self.shift_import_dialog),("⧉ Copy week…",self.copy_week_dialog),
                ("↶ Undo a copy / auto allocation…",self.remove_auto_dialog),("📅 Monday auto-import…",self.monday_dialog),
-               ("Worker Chains",self.chains_dialog),("Users",self.users_dialog)]
+               ("📊 Client guide & profit…",self.guide_dialog),("Users",self.users_dialog)]
         if self.role=="manager": items.append((f"⇪ Publish update…   (running {APP_VERSION})",self.publish_update_dialog))
         for i,(label,cmd) in enumerate(items):
             b=tk.Button(grid,text=label,command=cmd,bg=CARD,fg=TEXT,font=("Segoe UI Semibold",10),relief="flat",bd=0,cursor="hand2",padx=15,pady=18,activebackground=HOVER,activeforeground=TEXT,highlightbackground=BORDER,highlightthickness=1)
@@ -19086,6 +19320,17 @@ def monday_plan(path,snap=None):
             if cost is None: skip("would put the worker over their pay",label); continue
             plan["copy_rows"].append((wk,w,c,cat,h,day,MONDAY_NOTE_COPY+prev,r[12] or "",r[13] or ""))
             take(w,c,day,sp,cost)
+    # 3) how the week now compares with the client guide (reported, never filled blindly)
+    try: guides=load_client_guides()
+    except Exception: guides={}
+    gaps=[]
+    for c,g in guides.items():
+        for cat in CATEGORIES:
+            gh=guide_week_hours(g,cat)
+            if gh<=0.009: continue
+            have_h=sum(float(r[5] or 0) for r in week_rows if r[3]==c and r[4]==cat)+sum(r[4] for r in plan["cmv_rows"]+plan["copy_rows"] if r[2]==c and r[3]==cat)
+            if have_h<gh-0.01: gaps.append(f"{c} {CAT_ABBR.get(cat,cat)} {fmt(gh-have_h)}h under")
+    plan["guide_gaps"]=gaps
     plan["paid"]=sum(a for _w,_k,a in plan["wages"])
     plan["left"]=sum(max(0.0,wages.get((w,wk),0.0)-used.get(w,0.0)) for w in imported)
     return plan
@@ -19098,6 +19343,7 @@ def monday_summary_text(sm):
            f" + {sm['copy_n']} copied from last week ({fmt(sm['copy_h'])}h) · ${fmt(sm['left'])} still to allocate"]
     if sm.get("unmatched"): lines.append(f"⚠ {len(sm['unmatched'])} name(s) in the file need matching by hand: "+", ".join(sm["unmatched"][:6])+("…" if len(sm["unmatched"])>6 else ""))
     for reason,n in (sm.get("skipped") or {}).items(): lines.append(f"· {n} skipped — {reason}")
+    if sm.get("guide_gaps"): lines.append("Client guide: "+", ".join(sm["guide_gaps"][:8])+("…" if len(sm["guide_gaps"])>8 else ""))
     return "\n".join(lines)
 
 def _monday_skip_detail(sm):
@@ -19139,6 +19385,7 @@ def monday_run(folder=None,user="Monday auto",dry_run=False,log=None):
               cmv_n=len(plan["cmv_rows"]),cmv_h=sum(r[4] for r in plan["cmv_rows"]),
               copy_n=len(plan["copy_rows"]),copy_h=sum(r[4] for r in plan["copy_rows"]),left=plan["left"],
               skipped={k:len(v) for k,v in plan["skipped"].items()},skipped_detail={k:v[:40] for k,v in plan["skipped"].items()},
+              guide_gaps=plan.get("guide_gaps",[]),
               dry_run=bool(dry_run))
     if dry_run: return sm
     save_cmv_week_import_batch([],plan["wages"],plan["source_rows"],user) if plan["source_rows"] or plan["kind"].startswith("CareMile") \
@@ -19169,6 +19416,216 @@ def monday_headless():
         import traceback
         _monday_log("FAILED: "+traceback.format_exc().replace("\n"," | "))
         return 3
+
+# ======================================================================================
+# CLIENT GUIDE — the usual pattern of each client (from the "Calculation" sheet):
+# weekday hours per day × days per week, Saturday/Sunday/PH hours, the order workers
+# are tried in, the invoice discount and the monthly budget. Stored once for the whole
+# app (like user accounts), not per period. Used for plans, the dashboard, profit
+# margin and the Monday run.
+# ======================================================================================
+GUIDE_WEEKS_PER_MONTH=4          # the guide sheet counts a month as 4 weeks ($ per week = month / 4)
+
+def _guide_read_con():
+    return _users_read_connect()
+
+def _guide_write_con():
+    con=_users_write_connect()
+    con.execute("CREATE TABLE IF NOT EXISTS client_guide(client TEXT PRIMARY KEY, data TEXT, updated TEXT, updated_by TEXT)")
+    return con
+
+def load_client_guides():
+    """{client: guide dict}. Empty when no guide has been set up yet."""
+    try:
+        con=_guide_read_con()
+        try: rows=con.execute("SELECT client,data FROM client_guide").fetchall()
+        finally: con.close()
+    except Exception:
+        return {}
+    out={}
+    for c,d in rows:
+        try: out[c]=json.loads(d or "{}")
+        except Exception: pass
+    return out
+
+def save_client_guides(guides,user="system",replace_all=False):
+    """Save {client: guide}. replace_all=True removes clients not in `guides`."""
+    now=datetime.now().isoformat(timespec="seconds"); con=_guide_write_con()
+    try:
+        if replace_all: con.execute("DELETE FROM client_guide")
+        for c,g in guides.items():
+            if g is None: con.execute("DELETE FROM client_guide WHERE client=?",(c,)); continue
+            con.execute("INSERT OR REPLACE INTO client_guide(client,data,updated,updated_by) VALUES(?,?,?,?)",(c,json.dumps(g),now,user))
+        con.commit()
+    finally: con.close()
+    try: audit_write("EDIT","client guide","",",".join(sorted(k for k in guides)),"","",f"Client guide saved for {len(guides)} client(s)",user)
+    except Exception: pass
+
+def _guide_parse_hours(formula,value):
+    """'=8.5*((5*4)+2)' -> per_day 8.5, days_week 5 ; '=8*4' -> 8, 1 ; '=(6*(3*4))-4.5' -> 6, 3.
+    Returns (per_day, days_week) or (None, None) when the formula isn't that shape."""
+    f=str(formula or "").replace(" ","")
+    m=re.match(r"^=\(?([\d.]+)\*\(+([\d.]+)\*4\b",f)
+    if m: return float(m.group(1)),float(m.group(2))
+    m=re.match(r"^=([\d.]+)\*4$",f)
+    if m: return float(m.group(1)),1.0
+    return None,None
+
+def guide_week_hours(g,cat):
+    """Weekly guide hours for one category: hours/day × days/week when known, else month ÷ 4."""
+    c=(g.get("cats") or {}).get(cat) or {}
+    if c.get("per_day") is not None and c.get("days_week") is not None:
+        return float(c["per_day"])*float(c["days_week"])
+    return float(c.get("month",0) or 0)/GUIDE_WEEKS_PER_MONTH
+
+def guide_month_hours(g,cat):
+    c=(g.get("cats") or {}).get(cat) or {}
+    return float(c.get("month",0) or 0)
+
+def invoice_rate(cat,g=None):
+    """NDIS price for a category less the client's discount (the guide's '-1')."""
+    try: base=float(re.search(r"[\d.]+",INV_DEFAULTS[cat][2]).group(0))
+    except Exception: base=0.0
+    disc=float((g or {}).get("discount",1) or 0)
+    return max(0.0,base-disc)
+
+def guide_money(g,week=None):
+    """Monthly worker cost, invoice and margin of a guide at the rates of `week`."""
+    rates=global_rates_for_week(week)
+    cost=sum(guide_month_hours(g,c)*rates[c] for c in CATEGORIES)
+    inv=sum(guide_month_hours(g,c)*invoice_rate(c,g) for c in CATEGORIES)
+    margin=inv-cost
+    # "markup" is the guide sheet's P % (profit ÷ worker cost); "pct" is profit ÷ invoice.
+    return {"cost":cost,"invoice":inv,"margin":margin,"pct":(margin/inv*100 if inv>0 else 0.0),
+            "markup":(margin/cost*100 if cost>0 else 0.0),"budget":float(g.get("budget_month",0) or 0)}
+
+def parse_client_guide_workbook(path):
+    """Read the guide sheet (the one with 'WD … SAT SUN PH' headers) WITHOUT changing the file.
+    Returns {"rows":[...], "sheet":name} — one row per client in the sheet."""
+    import openpyxl
+    wbf=openpyxl.load_workbook(path,data_only=False,read_only=True)
+    wbv=openpyxl.load_workbook(path,data_only=True,read_only=True)
+    try:
+        for ws in wbf.worksheets:
+            grid=[list(r) for r in ws.iter_rows(min_row=1,max_row=min(ws.max_row or 0,80),values_only=True)]
+            hdr=None
+            for ri,row in enumerate(grid):
+                txt=[str(x or "").strip().upper() for x in row]
+                for ci,t in enumerate(txt):
+                    if t.startswith("WD") and txt[ci+1:ci+4]==["SAT","SUN","PH"]:
+                        hdr=(ri,ci); break
+                if hdr: break
+            if not hdr: continue
+            vals=[list(r) for r in wbv[ws.title].iter_rows(min_row=1,max_row=len(grid),values_only=True)]
+            hr,wd=hdr; head=[str(x or "").strip().lower() for x in grid[hr]]
+            def col(name,start=wd):
+                return next((i for i in range(start,len(head)) if head[i].startswith(name)),None)
+            inv_c=col("$$$ inv"); max_c=col("max")
+            people={}                                    # worker numbers ("2,1,5") -> names
+            for row in grid[hr+1:]:
+                # layout: [number] [worker name] [worker order "2,1,5"] [client] [WD] …
+                num=row[wd-4] if wd>=4 else None; nm=row[wd-3] if wd>=3 else None
+                if isinstance(num,(int,float)) and isinstance(nm,str) and nm.strip():
+                    people[int(num)]=nm.strip()
+            out=[]
+            for ri in range(hr+1,len(grid)):
+                row=grid[ri]; name=row[wd-1] if wd>=1 else None
+                if not isinstance(name,str) or not name.strip() or name.strip().upper() in ("T","TOTAL"): 
+                    if out: break
+                    continue
+                cats={}
+                for k,cat in enumerate(CATEGORIES):
+                    fv=row[wd+k]; vv=vals[ri][wd+k]
+                    try: month=float(vv if vv is not None else (fv if isinstance(fv,(int,float)) else 0))
+                    except Exception: month=0.0
+                    pdays,dw=_guide_parse_hours(fv,month) if isinstance(fv,str) else (None,None)
+                    cats[cat]={"month":round(month,4),"per_day":pdays,"days_week":dw,"formula":(fv if isinstance(fv,str) else "")}
+                nums=[int(x) for x in re.findall(r"\d+",str(row[wd-2] or ""))] if wd>=2 else []
+                disc=1.0
+                if inv_c is not None and isinstance(row[inv_c],str):
+                    m=re.search(r"\(\s*[\d.]+\s*-\s*([\d.]+)\s*\)",row[inv_c])
+                    if m: disc=float(m.group(1))
+                budget=None
+                if max_c is not None:
+                    try: budget=float(vals[ri][max_c])
+                    except Exception: budget=None
+                out.append({"name":name.strip(),"cats":cats,"workers":[people[n] for n in nums if n in people],
+                            "discount":disc,"budget_month":budget})
+            return {"sheet":ws.title,"rows":out}
+    finally:
+        wbf.close(); wbv.close()
+    return {"sheet":"","rows":[]}
+
+def guide_match_rows(rows,clients,workers):
+    """Pair each guide row with an app client (strict, as for CareMile) and its workers."""
+    out=[]
+    for r in rows:
+        c=cmv_resolve_client(r["name"],clients)
+        ws=[]
+        for w in r.get("workers",[]):
+            m,_=fuzzy_match(w,workers)
+            if not m:
+                first=[x for x in workers if x.lower().split()[0:1]==w.lower().split()[0:1]]
+                m=first[0] if len(first)==1 else None
+            ws.append((w,m))
+        out.append(dict(r,client=c,worker_matches=ws))
+    return out
+
+def allocations_hours_by(snap,clients=None):
+    """{(client, category, date): hours} for every allocation with a real date (day set)."""
+    out={}
+    wdates={wk:parse_week_date(snap.get("week_dates",{}).get(wk) or get_week_date(wk)) for wk in WEEKS}
+    for r in snap.get("allocations",[]):
+        if clients is not None and r[3] not in clients: continue
+        d=day_date_for(wdates.get(r[1]),r[8]) if r[8] else wdates.get(r[1])
+        if d is None: continue
+        k=(r[3],r[4],d); out[k]=out.get(k,0.0)+float(r[5] or 0)
+    return out
+
+def guide_status(snap,der,week,guides=None):
+    """Per guide client: guide vs allocated this week and this calendar month, and money.
+    Returns a list of dicts sorted by client name."""
+    guides=guides if guides is not None else load_client_guides()
+    if not guides: return []
+    we=parse_week_date(get_week_date(week)); month=(we.year,we.month) if we else None
+    by=allocations_hours_by(snap,set(guides))
+    rows=[]
+    for c,g in sorted(guides.items(),key=lambda kv:kv[0].lower()):
+        wk_g={cat:guide_week_hours(g,cat) for cat in CATEGORIES}
+        wk_a={cat:der["client_week_alloc"].get((c,week,cat),0.0) for cat in CATEGORIES}
+        mo_g={cat:guide_month_hours(g,cat) for cat in CATEGORIES}
+        mo_a={cat:sum(h for (cc,ct,d),h in by.items() if cc==c and ct==cat and month and (d.year,d.month)==month) for cat in CATEGORIES}
+        money=guide_money(g,week)
+        # actual money this month: worker cost of the allocations vs what they invoice
+        act_cost=0.0; act_inv=0.0
+        wdates={wk:parse_week_date(get_week_date(wk)) for wk in WEEKS}
+        for r in snap.get("allocations",[]):
+            if r[3]!=c: continue
+            d=day_date_for(wdates.get(r[1]),r[8]) if r[8] else wdates.get(r[1])
+            if not d or not month or (d.year,d.month)!=month: continue
+            act_cost+=float(r[7] or 0); act_inv+=float(r[5] or 0)*invoice_rate(r[4],g)
+        rows.append({"client":c,"guide":g,"week_guide":wk_g,"week_alloc":wk_a,"month_guide":mo_g,"month_alloc":mo_a,
+                     "week_diff":sum(wk_a.values())-sum(wk_g.values()),"money":money,
+                     "act_cost":act_cost,"act_invoice":act_inv,"act_margin":act_inv-act_cost,
+                     "month_label":(we.strftime("%B %Y") if we else "")})
+    return rows
+
+def guide_weekly_plans(guides,weeks=None):
+    """[(client, week, category, hours)] weekly plans from the guide. Public-holiday hours go
+    only into weeks that contain a Victorian public holiday (hours per day × PH days)."""
+    weeks=weeks or WEEKS; out=[]
+    for c,g in guides.items():
+        for wk in weeks:
+            we=parse_week_date(get_week_date(wk))
+            for cat in CATEGORIES:
+                if cat=="Public Holiday":
+                    pd=((g.get("cats") or {}).get(cat) or {}).get("per_day")
+                    n=sum(1 for i in range(7) if we and (we-timedelta(days=i)) in REV_VIC_PH)
+                    h=(float(pd)*n) if (pd is not None and n) else 0.0
+                else:
+                    h=guide_week_hours(g,cat)
+                out.append((c,wk,cat,round(h,2)))
+    return out
 
 def main():
     # FAST START: show login before any cloud/database bootstrap.
