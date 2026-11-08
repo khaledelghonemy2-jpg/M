@@ -9,7 +9,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 import sqlite3, hashlib, os, secrets, csv, json, gzip, re, urllib.request, urllib.error, uuid, socket, time, threading, queue, zipfile, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-APP_VERSION = "12.3.2"
+APP_VERSION = "12.3.3"
 APP_PRODUCT_NAME = "ALLOCATE PRO"
 APP_TAGLINE = "Paid → Reconciled → Remaining"
 
@@ -8583,6 +8583,7 @@ class App:
             b=mkbtn(head,"+ Add Allocation",self.alloc_dialog,PRIMARY); b.pack(side="right")
             Tooltip(b,"Ctrl + N")
             cb=mkbtn(head,"⧉ Copy week…",self.copy_week_dialog,SECONDARY); cb.pack(side="right",padx=(0,6))
+            pb=mkbtn(head,"📋 Paste shifts…",self.paste_shifts_dialog,SECONDARY); pb.pack(side="right",padx=(0,6))
             Tooltip(cb,"Copy chosen clients' shifts to another week")
         return head
 
@@ -11633,6 +11634,7 @@ class App:
         if n.startswith("Copied from"): return "Copy week"
         if n=="From payroll": return "Copy week (payroll)"
         if n.startswith("Monday auto"): return "Monday auto-import"
+        if n=="Pasted": return "Paste shifts"
         return None
 
     def remove_auto_dialog(self,source=None,only_last=False):
@@ -11644,7 +11646,7 @@ class App:
             tk.Label(top,text=lbl,fg=TEXT,bg=BG_DARK,font=FONTB).pack(side="left")
             ttk.Combobox(top,textvariable=var,values=vals,state="readonly",width=w).pack(side="left",padx=(6,16))
         fsrc=tk.StringVar(value=source or "(Anything automatic)"); fwk=tk.StringVar(value="(All weeks)"); fcli=tk.StringVar(value="(All clients)")
-        mkf("Made by:",fsrc,["(Anything automatic)","Monday auto-import","Copy week","Auto Allocate","Auto Allocate (Chain)"],22)
+        mkf("Made by:",fsrc,["(Anything automatic)","Paste shifts","Monday auto-import","Copy week","Auto Allocate","Auto Allocate (Chain)"],22)
         mkf("Week:",fwk,["(All weeks)"]+WEEKS,12)
         mkf("Client:",fcli,["(All clients)"]+list(self._snapshot.get("clients",[])),20)
         lastv=tk.BooleanVar(value=bool(only_last))
@@ -11674,7 +11676,7 @@ class App:
             if lastv.get():
                 # A copy (or a Monday run) saves all its shifts in one go, so they share
                 # the same "added" time: keep only the newest such batch.
-                batch=lambda s_:s_.startswith("Copy week") or s_=="Monday auto-import"
+                batch=lambda s_:s_.startswith("Copy week") or s_ in ("Monday auto-import","Paste shifts")
                 copies=[r for r,src in rows if batch(src)]
                 last=max((str(r[11] or "")[:19] for r in copies),default="")
                 rows=[(r,src) for r,src in rows if batch(src) and str(r[11] or "")[:19]==last]
@@ -11717,6 +11719,122 @@ class App:
     # the TO week go in FIRST; the copy fills the rest without clashing. "Small changes" moves
     # each start a little (keeps the length). A client still short of that week's estimate is
     # left short, or topped up on its copied shifts. Nothing is saved until you press Copy.
+    # ---------------- Paste shifts ----------------
+    def paste_shifts_dialog(self):
+        d,body=branded_dialog(self.root,"Paste shifts",
+            "Paste a message — one shift per line, e.g. “Anisa Mon 9-1 Harbour View”. Check the list on the right, then add the ready ones.",
+            1240,760)
+        snap=self._snapshot; wk0=self.cur_week.get()
+        top=tk.Frame(body,bg=BG_DARK); top.pack(fill="x",padx=16,pady=(10,4))
+        tk.Label(top,text="Lines without a date go into",fg=TEXT,bg=BG_DARK,font=FONT).pack(side="left")
+        wkv=tk.StringVar(value=wk0)
+        ttk.Combobox(top,textvariable=wkv,values=WEEKS,state="readonly",width=10,style="Modern.TCombobox").pack(side="left",padx=6)
+        wklbl=tk.Label(top,text="",fg=TEXT2,bg=BG_DARK,font=FONT); wklbl.pack(side="left")
+        foot=tk.Frame(body,bg=TOPBAR,highlightbackground=BORDER,highlightthickness=1); foot.pack(fill="x",side="bottom")
+        status=tk.Label(foot,text="",fg=TEXT2,bg=TOPBAR,font=("Segoe UI",9),anchor="w"); status.pack(side="left",padx=14,fill="x",expand=True)
+        split=tk.Frame(body,bg=BG_DARK); split.pack(fill="both",expand=True,padx=16,pady=6)
+        left=tk.Frame(split,bg=BG_DARK); left.pack(side="left",fill="y")
+        tk.Label(left,text="PASTE HERE",fg=TEXT2,bg=BG_DARK,font=("Segoe UI Semibold",8,"bold")).pack(anchor="w")
+        txt=tk.Text(left,width=40,height=26,bg=CARD,fg=TEXT,insertbackground=TEXT,relief="flat",font=("Segoe UI",ui_pt(10)),wrap="word",
+                    highlightthickness=1,highlightbackground=BORDER)
+        txt.pack(fill="y",expand=True,pady=(2,0))
+        right=tk.Frame(split,bg=BG_DARK); right.pack(side="left",fill="both",expand=True,padx=(12,0))
+        tk.Label(right,text="WHAT THE APP UNDERSTOOD — double-click a row to open it in Add Allocation",fg=TEXT2,bg=BG_DARK,
+                 font=("Segoe UI Semibold",8,"bold")).pack(anchor="w")
+        # the "does it add up to the message's total" lines sit above the table, always visible
+        totals=tk.Label(right,text="",fg=TEXT,bg=BG_DARK,font=("Segoe UI Semibold",ui_pt(9),"bold"),justify="left",anchor="w")
+        totals.pack(fill="x",pady=(2,4))
+        tree=make_fast_tree(right,("ok","worker","client","day","time","hours","cat","check"),
+                            ("","Worker","Client","Day","Time","Hours","Cat","Check"),
+                            (30,90,95,120,95,50,55,190),("c","w","w","w","w","e","w","w"),height=18)
+        state={"rows":[]}
+        def recompute(*_):
+            try: wklbl.config(text=f"(week ending {fmt_date(get_week_date(wkv.get()))})")
+            except Exception: pass
+            rows=parse_shift_message(txt.get("1.0","end"),snap.get("workers",[]),snap.get("clients",[]),wkv.get())
+            # checks against what is already in the period (and earlier lines of this paste)
+            wrates=snap.get("worker_rates",{}) or {}; der=self._derived
+            used={}; busy=[(r[1],r[2],r[8],_hhmm(r[12]),_hhmm(r[13])) for r in snap.get("allocations",[])]
+            for r in rows:
+                r["warn"]=""
+                if r["issue"]: continue
+                a=_hhmm(r["start"]); b=_hhmm(r["end"])
+                if a is not None and b is not None:
+                    if b<=a: b+=1440
+                    for wk_,w_,day_,a2,b2 in busy:
+                        if wk_==r["week"] and w_==r["worker"] and day_==r["day"] and a2 is not None and b2 is not None:
+                            b2=b2+1440 if b2<=a2 else b2
+                            if a<b2 and a2<b: r["issue"]="clashes with another shift of this worker"; break
+                    if not r["issue"]: busy.append((r["week"],r["worker"],r["day"],a,b))
+                if r["issue"]: continue
+                cost=r["hours"]*effective_rate(r["worker"],r["category"],wrates,week=r["week"])
+                k=(r["worker"],r["week"]); used[k]=used.get(k,der["worker_week_alloc"].get(k,0.0))+cost
+                paid=float(snap.get("wages",{}).get(k,0.0) or 0.0)
+                if used[k]>paid+0.01: r["warn"]=("not paid this week yet" if paid<=0.01 else f"${fmt(used[k]-paid)} over pay")
+            state["rows"]=rows
+            out=[]
+            for i,r in enumerate(rows):
+                ok=not r["issue"]
+                day=(f"{r['day']} · {r['date'].strftime('%d %b')}" if r.get("date") else (r["day"] or "—"))+("" if r["week"]==wkv.get() or not r["week"] else f" ({r['week']})")
+                check=r["issue"] or (("⚠ "+r["warn"]) if r["warn"] else "Ready")
+                out.append((str(i),("✓" if ok else "✗",r["worker"] or "?",r["client"] or "?",day,
+                             (f"{r['start']}–{r['end']}" if r["start"] else "—"),fmt(r["hours"]) if r["hours"] else "—",CAT_ABBR.get(r["category"],r["category"]),check),
+                            (("danger",) if not ok else (("warning",) if r["warn"] else ("odd" if i%2 else "even")))))
+            self._tree_replace(tree,out)
+            # each "Total amount … = $X" block: does it add up?
+            blocks={}
+            for r in rows:
+                if r.get("block_total") is None: continue
+                b=blocks.setdefault(r["block"],{"total":r["block_total"],"cost":0.0,"who":f"{r['worker'] or '?'} → {r['client'] or '?'}"})
+                if r["worker"] and r["week"] and r["hours"]:
+                    b["cost"]+=r["hours"]*effective_rate(r["worker"],r["category"],wrates,week=r["week"])
+            lines=[]
+            for b in blocks.values():
+                diff=b["cost"]-b["total"]
+                lines.append(f"{b['who']}: message says ${fmt(b['total'])} · these shifts cost ${fmt(b['cost'])}"
+                             +("  ✓ matches" if abs(diff)<0.01 else f"  ⚠ {'+' if diff>0 else '−'}${fmt(abs(diff))} different"))
+            totals.config(text="\n".join(lines),fg=(TEXT if all("✓" in l for l in lines) else WARNING))
+            n=sum(1 for r in rows if not r["issue"]); bad=len(rows)-n
+            status.config(text=(f"{n} shift(s) ready · {fmt(sum(r['hours'] for r in rows if not r['issue']))}h" if rows else "Paste your message on the left.")
+                          +(f"  ·  {bad} line(s) need fixing (✗) — fix the text, or double-click to finish it by hand" if bad else ""),
+                          fg=(WARNING if bad else TEXT))
+            addb.config(state=("normal" if n else "disabled"),text=f"＋  Add {n} shift(s)" if n else "＋  Add shifts")
+        job={"id":None}
+        def later(*_):
+            if job["id"]:
+                try: d.after_cancel(job["id"])
+                except Exception: pass
+            job["id"]=d.after(250,recompute)
+        txt.bind("<<Modified>>",lambda e:(txt.edit_modified(False),later()))
+        wkv.trace_add("write",later)
+        def open_row(_e=None):
+            sel=tree.focus()
+            if not sel: return
+            r=state["rows"][int(sel)]
+            self.alloc_dialog(prefill={"week":r["week"] or wkv.get(),"worker":r["worker"] or "","client":r["client"] or "",
+                                       "category":r["category"],"day":r["day"] or "","start":r["start"],"end":r["end"],
+                                       "hours":r["hours"] or "","_from":"the pasted message"})
+        tree.bind("<Double-1>",open_row)
+        def add():
+            ready=[r for r in state["rows"] if not r["issue"]]
+            if not ready: return
+            warn=sum(1 for r in ready if r["warn"])
+            if not messagebox.askyesno("Add shifts",f"Add {len(ready)} shift(s) ({fmt(sum(r['hours'] for r in ready))}h)?"
+                                       +(f"\n\n{warn} of them put a worker over their pay (shown in orange)." if warn else "")
+                                       +"\n\nLines marked ✗ are not added.",parent=d): return
+            data=[(r["week"],r["worker"],r["client"],r["category"],r["hours"],r["day"],"Pasted",r["start"],r["end"]) for r in ready]
+            addb.config(state="disabled",text="Adding…")
+            def done(n):
+                try: d.destroy()
+                except Exception: pass
+                self.refresh()
+                messagebox.showinfo("Added",f"{n} shift(s) added.\n\nChanged your mind? Settings & Tools › Undo removes them in one go.",parent=self.root)
+            def failed(exc):
+                addb.config(state="normal"); messagebox.showerror("Couldn't add",str(exc),parent=d)
+            self._background_job(lambda:save_allocations_batch(data,self.user),done,failed,sync_after=True,label="paste_shifts")
+        addb=mkbtn(foot,"＋  Add shifts",add,PRIMARY); addb.pack(side="right",padx=(6,14),pady=8)
+        txt.focus_set(); recompute()
+
     def copy_week_dialog(self):
         d,body=branded_dialog(self.root,"Copy Week",
             "Copy the shifts of the clients you pick from one week to another. Payroll shifts of that week go in first. Nothing is saved until you press Copy.",
@@ -19907,6 +20025,132 @@ def save_allocations_to_period(path,rows,user="system"):
     try: after()
     except Exception: pass
     return len(rows)
+
+# ======================================================================================
+# PASTE SHIFTS — turn a pasted message (WhatsApp / SMS / email) into allocations.
+# One shift per line, in any order, e.g.
+#     Anisa – Mon 9-1 Harbour View          Mais Sat 13:00–17:00 Wafaa
+#     Tom 14/9 9am-12 Pine Lodge             Ritima Sunday 6h Stephanie
+# A line holding only a day/date, a worker or a client applies to the lines below it.
+# Nothing is guessed silently: every line shows what was understood, and only lines
+# with a worker, a client, a day and hours (or times) can be added.
+# ======================================================================================
+_PASTE_DAYS={"mon":"Monday","monday":"Monday","tue":"Tuesday","tues":"Tuesday","tuesday":"Tuesday","wed":"Wednesday",
+             "wednesday":"Wednesday","thu":"Thursday","thur":"Thursday","thurs":"Thursday","thursday":"Thursday",
+             "fri":"Friday","friday":"Friday","sat":"Saturday","saturday":"Saturday","sun":"Sunday","sunday":"Sunday"}
+_PASTE_MONTHS={m.lower():i+1 for i,m in enumerate(["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"])}
+_PASTE_TIME=re.compile(r"(?<![\d/])(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a|p)?\s*(?:-|–|—|to|till|until)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a|p)?(?![\d/])",re.I)
+_PASTE_HOURS=re.compile(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b",re.I)
+_PASTE_DATE=re.compile(r"\b(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?\b")
+_PASTE_DATE2=re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b",re.I)
+
+def _paste_times(m):
+    """'9-1' -> 09:00-13:00 · '9am-1pm' · '13:00-17:30'. Returns (start, end) as HH:MM."""
+    h1,m1,ap1,h2,m2,ap2=m.groups()
+    h1=int(h1); h2=int(h2); m1=int(m1 or 0); m2=int(m2 or 0)
+    def fix(h,ap):
+        if ap and ap.lower().startswith("p") and h<12: return h+12
+        if ap and ap.lower().startswith("a") and h==12: return 0
+        return h
+    h1=fix(h1,ap1 or (ap2 if ap2 and ap2.lower().startswith("a") else None)); h2=fix(h2,ap2)
+    if not ap1 and not ap2 and h2<=h1 and h2<12 and h2+12>h1: h2+=12      # "9-1" means 9 am to 1 pm
+    if h1>23 or h2>24 or m1>59 or m2>59: return None
+    return f"{h1:02d}:{m1:02d}",f"{h2%24:02d}:{m2:02d}"
+
+def _paste_names(text,names):
+    """Names mentioned in the line: full name first, else a unique first name."""
+    low=" "+re.sub(r"[^a-z0-9 ]"," ",text.lower())+" "
+    full=[n for n in names if f" {re.sub(r'[^a-z0-9 ]',' ',n.lower()).strip()} " in low]
+    if full: return sorted(full,key=len,reverse=True)
+    firsts={}
+    for n in names:
+        f=re.sub(r"[^a-z0-9]","",n.lower().split()[0]) if n.split() else ""
+        if f and f" {f} " in low: firsts.setdefault(f,[]).append(n)
+    out=[]
+    for f,ns in firsts.items():
+        out.append(ns[0] if len(ns)==1 else None)
+    return out
+
+def parse_shift_message(text,workers,clients,default_week,week_dates=None):
+    """One dict per shift line: worker, client, week, day, start, end, hours, category,
+    plus 'issue' (what is missing/unclear, "" when ready)."""
+    week_dates=week_dates or {wk:get_week_date(wk) for wk in WEEKS}
+    ends={wk:parse_week_date(v) for wk,v in week_dates.items()}
+    def week_of(d):
+        for wk,e in ends.items():
+            if e and e-timedelta(days=6)<=d<=e: return wk
+        return None
+    ctx={"worker":None,"client":None,"day":None,"week":None,"date":None,"block":0,"total":None}
+    out=[]
+    for raw in (text or "").splitlines():
+        line=raw.strip(" \t•*-–—>")
+        if not line: continue
+        work=line
+        # "Mike's Total amount with Regan = $1064.10" — a new block with the amount to match
+        mt=re.search(r"(?:=|:)\s*\$\s*([\d,]+(?:\.\d+)?)",line) if re.search(r"\btotal\b",line,re.I) else None
+        block_total=float(mt.group(1).replace(",","")) if mt else None
+        if mt: work=work[:mt.start()]+" "+work[mt.end():]
+        # --- times / hours (a line can hold several: "10AM till 4PM, And from 7PM till 9PM") ---
+        spans=[]; hours=None
+        for m in list(_PASTE_TIME.finditer(work)):
+            t=_paste_times(m)
+            if t: spans.append(t)
+        if spans: work=_PASTE_TIME.sub(" ",work)
+        else:
+            mh=_PASTE_HOURS.search(work)
+            if mh: hours=float(mh.group(1)); work=work[:mh.start()]+" "+work[mh.end():]
+        st,et=(spans[0] if spans else (None,None))
+        # --- date / day ---
+        d=None
+        md=_PASTE_DATE.search(work) or None
+        if md:
+            try:
+                y=int(md.group(3)) if md.group(3) else (ends.get(default_week) or datetime.now().date()).year
+                if y<100: y+=2000
+                d=_date(y,int(md.group(2)),int(md.group(1))); work=work[:md.start()]+" "+work[md.end():]
+            except Exception: d=None
+        if d is None:
+            md=_PASTE_DATE2.search(work)
+            if md:
+                try:
+                    y=(ends.get(default_week) or datetime.now().date()).year
+                    d=_date(y,_PASTE_MONTHS[md.group(2)[:3].lower()],int(md.group(1))); work=work[:md.start()]+" "+work[md.end():]
+                except Exception: d=None
+        day=None
+        for tok in re.findall(r"[a-z]+",work.lower()):
+            if tok in _PASTE_DAYS: day=_PASTE_DAYS[tok]; break
+        if d is not None and not day: day=d.strftime("%A")
+        ws=[n for n in _paste_names(work,workers) if n]; cs=[n for n in _paste_names(work,clients) if n]
+        amb_w=None in _paste_names(work,workers); amb_c=None in _paste_names(work,clients)
+        cs=[c for c in cs if c not in ws]; ws=[w for w in ws if w not in cs]
+        has_shift=bool(st or hours)
+        # a line with no times/hours only sets context for the lines below it
+        if not has_shift:
+            if block_total is not None or (ws and cs):
+                ctx["block"]+=1; ctx["total"]=block_total; ctx["worker"]=None; ctx["client"]=None
+            if d is not None or day: ctx.update(day=day,date=d,week=(week_of(d) if d else None))
+            if len(ws)==1: ctx["worker"]=ws[0]
+            if len(cs)==1: ctx["client"]=cs[0]
+            continue
+        w=ws[0] if len(ws)==1 else (None if ws else ctx["worker"])
+        c=cs[0] if len(cs)==1 else (None if cs else ctx["client"])
+        if d is None and not day: d=ctx["date"]; day=ctx["day"]
+        wk=week_of(d) if d else (ctx["week"] if (day and day==ctx["day"] and ctx["week"]) else default_week)
+        cat="Saturday" if day=="Saturday" else ("Sunday" if day=="Sunday" else "Weekday")
+        dd=d or (day_date_for(ends.get(wk),day) if (wk and day) else None)
+        if re.search(r"\b(ph|public holiday)\b",line,re.I) or (dd and dd in REV_VIC_PH): cat="Public Holiday"
+        for (st,et) in (spans or [(None,None)]):
+            h=hours_between(st,et) if (st and et) else hours
+            issue=[]
+            if not w: issue.append("which worker?" if (len(ws)>1 or amb_w) else "no worker found")
+            if not c: issue.append("which client?" if (len(cs)>1 or amb_c) else "no client found")
+            if not day: issue.append("no day")
+            if d is not None and not wk: issue.append(f"{d.strftime('%d %b')} isn't in this period")
+            if not h or h<=0: issue.append("no hours")
+            out.append({"line":line,"worker":w,"client":c,"week":wk,"day":day,"date":dd,"start":st or "","end":et or "",
+                        "hours":round(h or 0,2),"category":cat,"issue":", ".join(issue),
+                        "block":ctx["block"],"block_total":ctx["total"]})
+    return out
 
 def main():
     # FAST START: show login before any cloud/database bootstrap.

@@ -85,4 +85,23 @@ assert _ap.guide_week_hours(g,"Weekday")==42.5
 m=_ap.guide_money(g,"Week 1")      # Week 1 ends 20 Sep 2026 -> old rates, like the guide sheet
 assert abs(m["cost"]-12096.82)<0.01 and abs(m["invoice"]-20122.33)<0.01 and abs(m["markup"]-66.34)<0.01, m
 print("client guide maths ok")
+# 11. Paste shifts: the real message format (worker's total with client, "Days:", "from X till Y", two shifts on one line)
+msg="""Mike's Total amount with Regan = $1064.10
+Days:
+Monday from 8PM till 10PM
+Sunday from 10AM till 4PM, And from 7PM till 9PM
+
+Khaled's Total amount with Regan = $923.64
+Days:
+Saturday from 6AM till 8PM
+Anisa - Tue 9-1 Regan
+Development@CareMile"""
+dates={wk:d for wk,d in zip(_ap.WEEKS,["2026-09-20","2026-09-27","2026-10-04","2026-10-11","2026-10-18","2026-10-25"])}
+rows=_ap.parse_shift_message(msg,["Mike","Khaled","Anisa Haddad"],["Regan","Stephanie"],"Week 1",dates)
+got=[(r["worker"],r["client"],r["day"],r["start"],r["end"],r["hours"],r["category"],r["issue"]) for r in rows]
+assert got==[("Mike","Regan","Monday","20:00","22:00",2.0,"Weekday",""),("Mike","Regan","Sunday","10:00","16:00",6.0,"Sunday",""),
+             ("Mike","Regan","Sunday","19:00","21:00",2.0,"Sunday",""),("Khaled","Regan","Saturday","06:00","20:00",14.0,"Saturday",""),
+             ("Anisa Haddad","Regan","Tuesday","09:00","13:00",4.0,"Weekday","")], got
+assert rows[0]["block_total"]==1064.10 and rows[3]["block_total"]==923.64
+print("paste shifts ok")
 print("ALL TESTS PASSED")
