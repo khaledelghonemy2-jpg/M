@@ -7388,7 +7388,7 @@ class App:
         self.view_roster_btn.config(bg=on if (roster and not byc) else off,fg="#FFFFFF" if (roster and not byc) else TEXT2)
         if getattr(self,"view_roster_c_btn",None) is not None:
             self.view_roster_c_btn.config(bg=on if (roster and byc) else off,fg="#FFFFFF" if (roster and byc) else TEXT2)
-        if roster: self.root.after_idle(self._draw_roster)
+        if roster: self._schedule_roster()
         else: self.root.after_idle(self._alloc_fit_page_size)
 
     def _worker_colour(self,worker):
@@ -7554,12 +7554,30 @@ class App:
         if not order:
             cv.create_text(W/2,head_h+60,text=self._alloc_empty_text().replace("\n","  ·  "),fill=TEXT2,font=f_small)
             cv.configure(height=head_h+120); return
+        _fit_cache={}
         def fit(text,font,width):
-            if font.measure(text)<=width: return text
-            while text and font.measure(text+"…")>width: text=text[:-1]
-            return text+"…"
-        hint=lambda t:self.roster_hint.config(text=t)
-        unhint=lambda e:self.roster_hint.config(text=self._ROSTER_HINT)
+            # Many cards repeat the same text (client names, times): measure each once.
+            key=(text,str(font),int(width))
+            hit=_fit_cache.get(key)
+            if hit is not None: return hit
+            out=text
+            if font.measure(text)>width:
+                lo,hi=0,len(text)            # binary search instead of one measure per dropped letter
+                while lo<hi:
+                    mid=(lo+hi+1)//2
+                    if font.measure(text[:mid]+"…")<=width: lo=mid
+                    else: hi=mid-1
+                out=text[:lo]+"…"
+            _fit_cache[key]=out
+            return out
+        # One set of mouse handlers on the canvas looks the item up here, instead of
+        # binding Enter/Leave/Click separately on thousands of cards and cells.
+        hits=self._roster_hits={}
+        def hit_tag(**info):
+            t=f"h{len(hits)}"; hits[t]=info; return t
+        self._roster_bind_once(cv,f_chip)
+        try: cv._ap_state["cur"]=None          # items were redrawn: next hover re-reads its hint
+        except Exception: pass
         for i,w in enumerate(order):
             n=max(len(cells.get((w,dn),[]))+len(gcells.get((w,dn),[])) for dn in cols) or 1
             gh=sum(g["hours"] for dn in _DAY_NAMES for g in gcells.get((w,dn),[]))
@@ -7573,22 +7591,12 @@ class App:
                 if dn not in _DAY_NAMES:
                     cv.create_rectangle(x,y,x+col_w,y+rh,fill=fillc,outline=""); continue
                 # Each day cell is a click target: click anywhere not on a shift to add one.
-                ctag=f"c{i}_{j}"
-                cv.create_rectangle(x,y,x+col_w,y+rh,fill=fillc,outline="",tags=(ctag,"cell"))
                 pre={"week":wk,"day":dn,"category":_CAT_OF_DAY.get(dn,"Weekday")}
                 pre["client" if byc else "worker"]=w
                 dd=day_date_for(we,dn)
                 label=f"+ Add a shift for {w} on {dn}"+(f" {dd.strftime('%d %b')}" if dd else "")
-                def _enter(e,t=ctag,lab=label,x0=x,y0=y,h0=rh):
-                    hint(lab)
-                    cv.delete("addhint")
-                    # disabled = never "under the mouse", so it can't steal Enter/Leave from the cell
-                    cv.create_text(x0+col_w/2,y0+h0-ui_px(9),text="+ Add",fill=PRIMARY,font=f_chip,tags=("addhint",),state="disabled")
-                def _leave(e):
-                    cv.delete("addhint"); unhint(e)
-                cv.tag_bind(ctag,"<Enter>",_enter)
-                cv.tag_bind(ctag,"<Leave>",_leave)
-                cv.tag_bind(ctag,"<Button-1>",lambda e,p=pre:self._roster_open_add(p,"roster"))
+                ctag=hit_tag(hint=label,click=(lambda p=pre:self._roster_open_add(p,"roster")),add_at=(x+col_w/2,y+rh-ui_px(9)))
+                cv.create_rectangle(x,y,x+col_w,y+rh,fill=fillc,outline="",tags=(ctag,"cell"))
             cv.create_text(12,y+pad+ui_px(10),text=fit(w,f_name,name_w-18),anchor="w",fill=TEXT,font=f_name)
             if byc:
                 est=sum(self._snapshot["estimates"].get((w,wk,cc),0.0) for cc in CATEGORIES)
@@ -7603,7 +7611,10 @@ class App:
                 for k,r in enumerate(real):
                     aid=r[0]; cl=r[OI]; cat=r[4]; h=float(r[5] or 0); st=r[12]; et=r[13]
                     hsum+=h
-                    cy=y+pad+k*(chip_h+pad); col=(self._worker_colour(cl) if byc else self._client_colour(cl)); tag=f"a{aid}"
+                    cy=y+pad+k*(chip_h+pad); col=(self._worker_colour(cl) if byc else self._client_colour(cl))
+                    detail=f"{r[2]} → {r[3]} · {CAT_ABBR.get(cat,cat)} · {fmt(h)}h · {dn if dn!='—' else 'no day'} {st or ''}{'–'+et if et else ''}  —  double-click to edit"
+                    if aid in bad: detail="⚠ times overlap or disagree with the hours  ·  "+detail
+                    tag=hit_tag(hint=detail,dbl=(lambda a=aid:self.edit_alloc(a,extra_refresh=lambda:self._refresh_current_route())))
                     cv.create_rectangle(x+3,cy,x+col_w-3,cy+chip_h,fill=_mix_hex(CARD,col,.20),
                                         outline=(DANGER if aid in bad else _mix_hex(CARD,col,.45)),width=(2 if aid in bad else 1),tags=(tag,"chip"))
                     cv.create_rectangle(x+3,cy,x+7,cy+chip_h,fill=col,outline="",tags=(tag,"chip"))
@@ -7611,28 +7622,21 @@ class App:
                     t2=f"{fmt(h)}h · "+cl+("" if cat=="Weekday" else f" · {CAT_ABBR.get(cat,cat)}")
                     cv.create_text(x+12,cy+chip_h*0.30,text=fit(t1,f_chip,col_w-20),anchor="w",fill=TEXT,font=f_chip,tags=(tag,"chip"))
                     cv.create_text(x+12,cy+chip_h*0.70,text=fit(t2,f_small,col_w-20),anchor="w",fill=TEXT2,font=f_small,tags=(tag,"chip"))
-                    detail=f"{r[2]} → {r[3]} · {CAT_ABBR.get(cat,cat)} · {fmt(h)}h · {dn if dn!='—' else 'no day'} {st or ''}{'–'+et if et else ''}  —  double-click to edit"
-                    if aid in bad: detail="⚠ times overlap or disagree with the hours  ·  "+detail
-                    cv.tag_bind(tag,"<Enter>",lambda e,t=detail:hint(t))
-                    cv.tag_bind(tag,"<Leave>",unhint)
-                    cv.tag_bind(tag,"<Double-1>",lambda e,a=aid:self.edit_alloc(a,extra_refresh=lambda:self._refresh_current_route()))
                 # CareMile shifts with nothing allocated against them: dashed, click to allocate.
                 for k,g in enumerate(gcells.get((w,dn),[]),start=len(real)):
-                    cy=y+pad+k*(chip_h+pad); tag=f"g{g['id']}_{k}"
-                    cv.create_rectangle(x+3,cy,x+col_w-3,cy+chip_h,fill=CARD,outline=TEXT2,dash=(4,3),width=1,tags=(tag,"ghost"))
-                    t1=(f"{g['start']}–{g['end']}" if g["start"] and g["end"] else (f"from {g['start']}" if g["start"] else "no time"))+"  CareMile"
-                    t2=f"{fmt(g['hours'])}h · {gother(g)}"
-                    cv.create_text(x+8,cy+chip_h*0.30,text=fit(t1,f_chip,col_w-16),anchor="w",fill=CYAN,font=f_chip,tags=(tag,"ghost"))
-                    cv.create_text(x+8,cy+chip_h*0.70,text=fit(t2,f_small,col_w-16),anchor="w",fill=TEXT2,font=f_small,tags=(tag,"ghost"))
+                    cy=y+pad+k*(chip_h+pad)
                     who=f"{g['worker']} → {g['client'] or g['raw']}"
                     note=("" if g["client"] else f"  ·  '{g['raw']}' isn't one of your clients yet — pick the client in the form")
                     part=(f" (rest of the {g['shift']} shift — part is already allocated)" if g["partial"] else "")
                     detail=f"CareMile: {who} · {dn} {g['shift']} · {fmt(g['hours'])}h not allocated{part}  —  click to allocate{note}"
                     pre={"week":wk,"worker":g["worker"],"client":g["client"] or "","category":g["category"],"day":dn,
                          "start":g["start"],"end":g["end"],"hours":g["hours"]}
-                    cv.tag_bind(tag,"<Enter>",lambda e,t=detail:hint(t))
-                    cv.tag_bind(tag,"<Leave>",unhint)
-                    cv.tag_bind(tag,"<Button-1>",lambda e,p=pre:self._roster_open_add(p,"CareMile"))
+                    tag=hit_tag(hint=detail,click=(lambda p=pre:self._roster_open_add(p,"CareMile")))
+                    cv.create_rectangle(x+3,cy,x+col_w-3,cy+chip_h,fill=CARD,outline=TEXT2,dash=(4,3),width=1,tags=(tag,"ghost"))
+                    t1=(f"{g['start']}–{g['end']}" if g["start"] and g["end"] else (f"from {g['start']}" if g["start"] else "no time"))+"  CareMile"
+                    t2=f"{fmt(g['hours'])}h · {gother(g)}"
+                    cv.create_text(x+8,cy+chip_h*0.30,text=fit(t1,f_chip,col_w-16),anchor="w",fill=CYAN,font=f_chip,tags=(tag,"ghost"))
+                    cv.create_text(x+8,cy+chip_h*0.70,text=fit(t2,f_small,col_w-16),anchor="w",fill=TEXT2,font=f_small,tags=(tag,"ghost"))
             tx=W-tot_w+10
             cv.create_text(tx,y+pad+ui_px(10),text=f"{fmt(hsum)}h",anchor="w",fill=TEXT,font=f_name)
             if byc:
@@ -7664,6 +7668,53 @@ class App:
         n_g=len(ghosts)
         if hasattr(self,"roster_cmv_btn"):
             self.roster_cmv_btn.config(text=(f"☑ CareMile shifts · {n_g} to allocate" if APP_FOLDS.get("roster_cmv",True) else "☐ CareMile shifts"))
+
+    def _roster_bind_once(self,cv,f_chip):
+        """Install the roster's mouse handlers once; they look up self._roster_hits."""
+        self._roster_font=f_chip
+        if getattr(cv,"_ap_hits_bound",False): return
+        cv._ap_hits_bound=True
+        state=cv._ap_state={"cur":None,"last_click":0.0}
+        def info_at():
+            for it in cv.find_withtag("current"):
+                for t in cv.gettags(it):
+                    if t.startswith("h") and t[1:].isdigit():
+                        return t,self._roster_hits.get(t)
+            return None,None
+        def show(t,info):
+            cv.delete("addhint")
+            if info is None:
+                self.roster_hint.config(text=self._ROSTER_HINT); return
+            self.roster_hint.config(text=info.get("hint",""))
+            if info.get("add_at"):
+                x,y=info["add_at"]
+                # disabled = never "under the mouse", so it can't steal the hover from the cell
+                cv.create_text(x,y,text="+ Add",fill=PRIMARY,font=self._roster_font,tags=("addhint",),state="disabled")
+        def motion(_e=None):
+            t,info=info_at()
+            if t!=state["cur"]:
+                state["cur"]=t; show(t,info)
+        def leave(_e=None):
+            state["cur"]=None; show(None,None)
+        def click(_e=None):
+            t,info=info_at()
+            if not info or not info.get("click"): return
+            now=time.monotonic()
+            if now-state["last_click"]<0.6: return     # a double-click must not open two forms
+            state["last_click"]=now; info["click"]()
+        def dbl(_e=None):
+            t,info=info_at()
+            if info and info.get("dbl"): info["dbl"]()
+        cv.bind("<Motion>",motion,add="+"); cv.bind("<Leave>",leave,add="+")
+        cv.bind("<Button-1>",click,add="+"); cv.bind("<Double-1>",dbl,add="+")
+
+    def _schedule_roster(self):
+        """Redraw the roster once, however many refreshes ask for it in one go."""
+        if getattr(self,"_roster_pending",False): return
+        self._roster_pending=True
+        def run():
+            self._roster_pending=False; self._draw_roster()
+        self.root.after_idle(run)
 
     def _toggle_roster_cmv(self):
         APP_FOLDS["roster_cmv"]=not APP_FOLDS.get("roster_cmv",True)
@@ -8869,7 +8920,7 @@ class App:
             if q and q not in blob: continue
             shown.append(r)
         self._alloc_shown_all=shown
-        if APP_FOLDS.get("roster",False): self.root.after_idle(self._draw_roster)
+        if APP_FOLDS.get("roster",False): self._schedule_roster()
         pages=max(1,(len(shown)+self._alloc_page_size-1)//self._alloc_page_size); self._alloc_page=min(self._alloc_page,pages-1)
         self._alloc_pages=pages
         a=self._alloc_page*self._alloc_page_size; b=a+self._alloc_page_size; page=shown[a:b]
@@ -9500,7 +9551,7 @@ class App:
         d,body=branded_dialog(self.root,"Settings & Tools","Imports and specialist tools — everyday editing stays in its main screen",720,500)
         grid=tk.Frame(body,bg=BG_DARK); grid.pack(fill="both",expand=True,padx=20,pady=18)
         items=[("Import Payroll",self.payroll_import_dialog),("Import Shift CSV",self.shift_import_dialog),("⧉ Copy week…",self.copy_week_dialog),
-               ("Worker Chains",self.chains_dialog),("Users",self.users_dialog)]
+               ("↶ Undo a copy / auto allocation…",self.remove_auto_dialog),("Worker Chains",self.chains_dialog),("Users",self.users_dialog)]
         if self.role=="manager": items.append((f"⇪ Publish update…   (running {APP_VERSION})",self.publish_update_dialog))
         for i,(label,cmd) in enumerate(items):
             b=tk.Button(grid,text=label,command=cmd,bg=CARD,fg=TEXT,font=("Segoe UI Semibold",10),relief="flat",bd=0,cursor="hand2",padx=15,pady=18,activebackground=HOVER,activeforeground=TEXT,highlightbackground=BORDER,highlightthickness=1)
@@ -11141,61 +11192,78 @@ class App:
         tk.Label(inner,text="Green = wage still available this week   ·   Red = over-allocated",
                  fg=TEXT2,bg=BG_DARK,font=("Segoe UI",8)).pack(anchor="w",padx=10,pady=(0,10))
 
+    @staticmethod
+    def _auto_source(note):
+        """Which automatic tool made an allocation, from its note; None = typed by hand."""
+        n=str(note or "")
+        if n=="auto": return "Auto Allocate"
+        if n=="auto-chain": return "Auto Allocate (Chain)"
+        if n.startswith("Copied from"): return "Copy week"
+        if n=="From payroll": return "Copy week (payroll)"
+        return None
+
     def remove_auto_dialog(self):
-        d,body=branded_dialog(self.root,"Remove Auto Allocations",
-            "Removes allocations created by Auto Allocate or Auto Allocate (Chain). Choose a week and/or client, or leave blank for all.",
-            820,680)
+        d,body=branded_dialog(self.root,"Remove Auto & Copied Allocations",
+            "Undo what the app added for you: Auto Allocate, Auto Allocate (Chain) and Copy week. Shifts typed by hand are never listed here.",
+            900,700)
         top=tk.Frame(body,bg=BG_DARK); top.pack(fill="x",padx=16,pady=(10,6))
-        tk.Label(top,text="Week:",fg=TEXT,bg=BG_DARK,font=FONTB).pack(side="left")
-        fwk=tk.StringVar()
-        ttk.Combobox(top,textvariable=fwk,values=["(All weeks)"]+WEEKS,state="readonly",width=14).pack(side="left",padx=(6,16))
-        tk.Label(top,text="Client:",fg=TEXT,bg=BG_DARK,font=FONTB).pack(side="left")
-        fcli=tk.StringVar()
-        ttk.Combobox(top,textvariable=fcli,values=["(All clients)"]+list_clients(),state="readonly",width=20).pack(side="left",padx=6)
-        fwk.set("(All weeks)"); fcli.set("(All clients)")
+        def mkf(lbl,var,vals,w):
+            tk.Label(top,text=lbl,fg=TEXT,bg=BG_DARK,font=FONTB).pack(side="left")
+            ttk.Combobox(top,textvariable=var,values=vals,state="readonly",width=w).pack(side="left",padx=(6,16))
+        fsrc=tk.StringVar(value="(Anything automatic)"); fwk=tk.StringVar(value="(All weeks)"); fcli=tk.StringVar(value="(All clients)")
+        mkf("Made by:",fsrc,["(Anything automatic)","Copy week","Auto Allocate","Auto Allocate (Chain)"],22)
+        mkf("Week:",fwk,["(All weeks)"]+WEEKS,12)
+        mkf("Client:",fcli,["(All clients)"]+list(self._snapshot.get("clients",[])),20)
+        lastv=tk.BooleanVar(value=False)
+        tk.Checkbutton(top,text="Only the last copy",variable=lastv,fg=TEXT,bg=BG_DARK,selectcolor=BG_LIGHT,
+                       activebackground=BG_DARK,activeforeground=TEXT,font=FONT,command=lambda:build_preview()).pack(side="left")
 
         tk.Label(body,text="Preview — allocations that will be REMOVED:",fg=DANGER,bg=BG_DARK,font=FONTB).pack(anchor="w",padx=16,pady=(6,2))
         prevwrap=tk.Frame(body,bg=BG_DARK); prevwrap.pack(fill="both",expand=True,padx=16)
-        prev_inner=self._scrollable(prevwrap)
+        prev_tree=make_fast_tree(prevwrap,("week","worker","client","cat","hrs","cost","src","when"),
+                                 ("Week","Worker","Client","Cat","Hours","Cost","Made by","Added"),
+                                 (130,140,150,55,60,80,150,120),("w","w","w","c","e","e","w","w"),height=14)
         cntlbl=tk.Label(body,text="",fg=ACCENT,bg=BG_DARK,font=FONTB); cntlbl.pack(anchor="w",padx=16,pady=(6,4))
 
         matches_holder=[[]]
         def build_preview(*_):
-            for ch in prev_inner.winfo_children(): ch.destroy()
-            wk_f=fwk.get(); cli_f=fcli.get()
-            weeks_scope = WEEKS if wk_f in ("","(All weeks)") else [wk_f]
-            matches=[]
-            for wk in weeks_scope:
-                for r in allocations_for(wk):
-                    aid,week,worker,client,cat,hrs,rate,cost,day,note,created_by=r
-                    if note not in ("auto","auto-chain"): continue
-                    if cli_f not in ("","(All clients)") and client!=cli_f: continue
-                    matches.append(r)
-            matches_holder[0]=matches
-            if not matches:
-                tk.Label(prev_inner,text="Nothing matches — no automated allocations found for this selection.",
-                         fg=TEXT2,bg=BG_DARK,font=FONT).pack(anchor="w",pady=6)
-            else:
-                hdr=tk.Frame(prev_inner,bg=BG_DARK); hdr.pack(fill="x")
-                for t,wd in [("Week",18),("Worker",14),("Client",14),("Cat",8),("Hours",8),("Cost",10),("Source",10)]:
-                    tk.Label(hdr,text=t,fg=TEXT2,bg=BG_DARK,font=("Segoe UI",8,"bold"),width=wd,anchor="w").pack(side="left")
-                for r in matches:
-                    aid,week,worker,client,cat,hrs,rate,cost,day,note,created_by=r
-                    rw=tk.Frame(prev_inner,bg=BG_DARK); rw.pack(fill="x",pady=1)
-                    for val,wd in [(week_label_short(week),18),(worker,14),(client,14),(CAT_ABBR[cat],8),
-                                   (fmt(hrs),8),("$"+fmt(cost),10),(note,10)]:
-                        tk.Label(rw,text=val,fg=TEXT,bg=BG_DARK,font=("Segoe UI",9),width=wd,anchor="w").pack(side="left")
-            th=sum(r[5] for r in matches); tc=sum(r[7] for r in matches)
-            cntlbl.config(text=f"{len(matches)} allocation(s) match — {fmt(th)} hours, ${fmt(tc)} total.")
-        for v in (fwk,fcli): v.trace_add("write",build_preview)
+            src_f=fsrc.get(); wk_f=fwk.get(); cli_f=fcli.get()
+            rows=[]
+            for r in self._snapshot.get("allocations",[]):
+                if str(r[0]).startswith("-"): continue          # still syncing — not deletable yet
+                src=self._auto_source(r[9])
+                if not src: continue
+                if src_f=="Copy week" and not src.startswith("Copy week"): continue
+                if src_f not in ("","(Anything automatic)","Copy week") and src!=src_f: continue
+                if wk_f not in ("","(All weeks)") and r[1]!=wk_f: continue
+                if cli_f not in ("","(All clients)") and r[3]!=cli_f: continue
+                rows.append((r,src))
+            if lastv.get():
+                # A copy saves all its shifts in one go, so they share the same "added" time.
+                copies=[r for r,src in rows if src.startswith("Copy week")]
+                last=max((str(r[11] or "")[:19] for r in copies),default="")
+                rows=[(r,src) for r,src in rows if src.startswith("Copy week") and str(r[11] or "")[:19]==last]
+            matches_holder[0]=[r for r,_s in rows]
+            wl={wk:week_label_short(wk) for wk in WEEKS}
+            def when(c):
+                try: return datetime.fromisoformat(str(c)).strftime("%d %b %H:%M")
+                except Exception: return str(c or "")
+            self._tree_replace(prev_tree,[(None,(wl.get(r[1],r[1]),r[2],r[3],CAT_ABBR.get(r[4],r[4]),fmt(float(r[5] or 0)),
+                                                 "$"+fmt(float(r[7] or 0)),src,when(r[11])),("odd" if i%2 else "even",))
+                                          for i,(r,src) in enumerate(rows)])
+            th=sum(float(r[5] or 0) for r,_s in rows); tc=sum(float(r[7] or 0) for r,_s in rows)
+            cntlbl.config(text=(f"{len(rows)} allocation(s) match — {fmt(th)} hours, ${fmt(tc)} total." if rows
+                                else "Nothing matches — no automatic or copied allocations for this selection."))
+        for v in (fsrc,fwk,fcli): v.trace_add("write",build_preview)
 
         def do_remove():
             matches=matches_holder[0]
             if not matches:
-                messagebox.showinfo("Nothing to remove","No automated allocations match this selection.",parent=d); return
-            th=sum(r[5] for r in matches); tc=sum(r[7] for r in matches)
+                messagebox.showinfo("Nothing to remove","No automatic or copied allocations match this selection.",parent=d); return
+            th=sum(float(r[5] or 0) for r in matches); tc=sum(float(r[7] or 0) for r in matches)
             if not messagebox.askyesno("Confirm Remove",
-                    f"Permanently remove {len(matches)} automated allocation(s) — {fmt(th)} hours, ${fmt(tc)}?\n\nThis cannot be undone (though your period is backed up automatically).",parent=d):
+                    f"Permanently remove {len(matches)} allocation(s) — {fmt(th)} hours, ${fmt(tc)}?\n\nShifts typed by hand are not touched.\n"
+                    "This cannot be undone (though your period is backed up automatically).",parent=d):
                 return
             aids=[r[0] for r in matches]
             remove_auto_btn.config(state="disabled",text="Removing…")
@@ -11247,11 +11315,23 @@ class App:
         tk.Radiobutton(mode2,text="Leave it short",variable=shortv,value="leave",**CK).pack(side="left",padx=6)
         tk.Radiobutton(mode2,text="Top up: make its copied shifts longer (no clash, 12h a day max, only while the worker has wage left)",
                        variable=shortv,value="topup",**CK).pack(side="left",padx=6)
+        allow21v=tk.BooleanVar(value=False); skipoverv=tk.BooleanVar(value=False)
+        mode3=tk.Frame(body,bg=CARD,highlightbackground=BORDER,highlightthickness=1); mode3.pack(fill="x",padx=16,pady=(0,6))
+        tk.Label(mode3,text="CHECKS",fg=TEXT2,bg=CARD,font=("Segoe UI Semibold",8,"bold")).pack(side="left",padx=(12,8),pady=6)
+        tk.Checkbutton(mode3,text="Allow 2:1 (two workers with the same client at the same time)",variable=allow21v,**CK).pack(side="left",padx=6)
+        tk.Checkbutton(mode3,text="Leave out shifts that would put a worker over their pay",variable=skipoverv,**CK).pack(side="left",padx=6)
         # clients with shifts in the FROM week
         cl=tk.Frame(body,bg=CARD,highlightbackground=BORDER,highlightthickness=1); cl.pack(fill="x",padx=16,pady=(0,6))
         clhead=tk.Frame(cl,bg=CARD); clhead.pack(fill="x")
         tk.Label(clhead,text="CLIENTS",fg=TEXT2,bg=CARD,font=("Segoe UI Semibold",8,"bold")).pack(side="left",padx=12,pady=(8,2))
-        clbox=tk.Frame(cl,bg=CARD); clbox.pack(fill="x",padx=10,pady=(0,8))
+        # Many clients must not push the preview off the window: the list scrolls in a box
+        # of at most ~5 rows instead of growing.
+        clscroll=ScrollArea(cl,CARD); clscroll.pack(fill="x",padx=10,pady=(0,8))
+        clbox=clscroll.body
+        def _fit_clients(_e=None):
+            try: clscroll.canvas.configure(height=min(max(28,clbox.winfo_reqheight()),ui_px(132)))
+            except Exception: pass
+        clbox.bind("<Configure>",_fit_clients,add="+")
         cvars={}
         def all_clients(val):
             for v in cvars.values(): v.set(val)
@@ -11272,10 +11352,15 @@ class App:
                 v=tk.BooleanVar(value=old.get(c,False)); cvars[c]=v
                 tk.Checkbutton(clbox,text=f"{c}  ({fmt(hrs[c])}h)",variable=v,command=build_preview,anchor="w",**CK).grid(row=i//4,column=i%4,sticky="w",padx=4,pady=1)
         covbox=tk.Frame(body,bg=CARD,highlightbackground=BORDER,highlightthickness=1)
-        covlbl=tk.Label(covbox,text="",fg=TEXT,bg=CARD,font=("Consolas",ui_pt(9)),justify="left",anchor="w")
-        tk.Label(covbox,text="DOES IT COVER THE WEEK?  (that week's estimate vs what it will have after the copy)",fg=TEXT2,bg=CARD,
+        tk.Label(covbox,text="DOES IT COVER THE WEEK?  (that week's estimate vs what it will have after the copy — problems first)",fg=TEXT2,bg=CARD,
                  font=("Segoe UI Semibold",8,"bold")).pack(anchor="w",padx=12,pady=(6,0))
-        covlbl.pack(anchor="w",fill="x",padx=12,pady=(2,6))
+        covscroll=ScrollArea(covbox,CARD); covscroll.pack(fill="x",padx=12,pady=(2,6))
+        covlbl=tk.Label(covscroll.body,text="",fg=TEXT,bg=CARD,font=("Consolas",ui_pt(9)),justify="left",anchor="w")
+        covlbl.pack(anchor="w",fill="x")
+        def _fit_cov(_e=None):
+            try: covscroll.canvas.configure(height=min(max(18,covscroll.body.winfo_reqheight()),ui_px(96)))
+            except Exception: pass
+        covscroll.body.bind("<Configure>",_fit_cov,add="+")
         tk.Label(body,text="PREVIEW — double-click a row to leave it out or put it back",fg=TEXT2,bg=BG_DARK,
                  font=("Segoe UI Semibold",8,"bold")).pack(anchor="w",padx=18,pady=(4,2))
         foot=tk.Frame(body,bg=TOPBAR,highlightbackground=BORDER,highlightthickness=1); foot.pack(fill="x",side="bottom")
@@ -11329,6 +11414,15 @@ class App:
                 cat="Saturday" if day=="Saturday" else "Sunday" if day=="Sunday" else "Weekday"
                 out.append({"worker":r[2],"client":c,"cat":cat,"hours":round(h,4),"day":day,"st":r[9] or "","et":r[10] or ""})
             return out
+        def to_category(tw,day,cat):
+            """Category for a shift on `day` of week tw: a Victorian public holiday that day
+            makes it Public Holiday; a Public Holiday shift copied onto an ordinary day goes
+            back to Weekday/Saturday/Sunday. Returns (category, note or "")."""
+            try: dd=day_date_for(parse_week_date(get_week_date(tw)),day) if day else None
+            except Exception: dd=None
+            if dd and dd in REV_VIC_PH: return "Public Holiday",("" if cat=="Public Holiday" else f"Public holiday {dd.strftime('%d %b')} — PH rate")
+            if cat=="Public Holiday": return _CAT_OF_DAY.get(day,"Weekday"),"Not a public holiday in this week"
+            return cat,""
         def build_preview(*_,new_seed=False):
             import random as _rnd
             if new_seed: plan["seed"]+=1
@@ -11350,7 +11444,7 @@ class App:
             def clash(day,w,c,a,b,skip=None):
                 for (w2,c2,a2,b2,ix) in busy.get(day,[]):
                     if skip is not None and ix==skip: continue
-                    if a<b2 and a2<b and (w2==w or c2==c): return f"{w2} / {c2} already {hhmm(a2)}–{hhmm(b2)}"
+                    if a<b2 and a2<b and (w2==w or (c2==c and not allow21v.get())): return f"{w2} / {c2} already {hhmm(a2)}–{hhmm(b2)}"
                 return None
             def add(p):
                 plan["rows"].append(p); return len(plan["rows"])-1
@@ -11369,15 +11463,17 @@ class App:
                         if w2==p["worker"] and c2==p["client"] and day2==p["day"] and (sp is None or sp2 is None or (sp[0]<sp2[1] and sp2[0]<sp[1])):
                             dup=True; break
                     pay_days.add((p["worker"],p["client"],p["day"]))
+                    p["cat"],phn=to_category(tw,p["day"],p["cat"])
                     if dup:
                         add(dict(p,use=False,src="payroll",was="",note="Payroll shift already in that week")); continue
                     why=clash(p["day"],p["worker"],p["client"],*sp) if sp and p["day"] else None
-                    ix=add(dict(p,use=not why,src="payroll",was="",note=("From payroll" if not why else "From payroll — clash: "+why)))
+                    ix=add(dict(p,use=not why,src="payroll",was="",note=("From payroll" if not why else "From payroll — clash: "+why)+(f" · {phn}" if phn else "")))
                     if sp and p["day"] and not why: busy.setdefault(p["day"],[]).append([p["worker"],p["client"],sp[0],sp[1],ix])
             # 2) the copy fills the rest
             rows=sorted([r for r in src_rows() if r[3] in picked],key=lambda r:(DAY_OFFSET.get(r[8],9),(r[12] if len(r)>12 else "") or "",r[2]))
             for r in rows:
                 w,c,cat,h,day=r[2],r[3],r[4],float(r[5] or 0),r[8] or ""
+                cat,phn=to_category(tw,day,cat)
                 st=(r[12] if len(r)>12 else "") or ""; et=(r[13] if len(r)>13 else "") or ""
                 sp=span(st,et); nst,net=st,et; note="OK"; use=True
                 if (w,c,day) in pay_days:
@@ -11398,12 +11494,34 @@ class App:
                         nst,net=hhmm(a+chosen),hhmm(a+chosen+L)
                         if chosen: note=f"Start {'+' if chosen>0 else '−'}{abs(chosen)} min"
                 elif not day: note="No day set — copied without a day"
+                if phn: note=phn if note=="OK" else note+" · "+phn
                 ix=add({"use":use,"src":"copy","worker":w,"client":c,"cat":cat,"hours":h,"day":day,"st":nst,"et":net,"was":f"{st}–{et}" if st else "","note":note})
                 if use and day and nst and net:
                     s2=span(nst,net); busy.setdefault(day,[]).append([w,c,s2[0],s2[1],ix])
             # 3) top up clients still short (only the copied shifts are made longer)
             if shortv.get()=="topup": top_up(tw,busy,clash)
+            if skipoverv.get():
+                for i in pay_over(tw,only_used=True):
+                    plan["rows"][i]["use"]=False
+                    plan["rows"][i]["note"]="Left out — would put the worker over their pay"
             draw()
+        def pay_over(tw,only_used=True):
+            """Rows (in plan order) that take their worker past what they were paid in week tw.
+            Returns {row index: (amount over after this row, paid)}."""
+            wrates=snap.get("worker_rates",{}) or {}
+            paid={w:float(v or 0) for (w,wk),v in (snap.get("wages",{}) or {}).items() if wk==tw}
+            used={}
+            for r in snap.get("allocations",[]):
+                if r[1]==tw: used[r[2]]=used.get(r[2],0.0)+float(r[7] or 0)
+            out={}
+            for i,p in enumerate(plan["rows"]):
+                if only_used and not p["use"]: continue
+                try: rate=effective_rate(p["worker"],p["cat"],wrates,week=tw)
+                except Exception: rate=GLOBAL_RATES.get(p["cat"],0)
+                used[p["worker"]]=used.get(p["worker"],0.0)+p["hours"]*rate
+                over=used[p["worker"]]-paid.get(p["worker"],0.0)
+                if over>0.01: out[i]=(over,paid.get(p["worker"],0.0))
+            return out
         def top_up(tw,busy,clash):
             est=snap.get("estimates",{}) or {}; wrates=snap.get("worker_rates",{}) or {}
             have={}
@@ -11449,15 +11567,27 @@ class App:
                     if x>0: plan["rows"][i]["note"]=(plan["rows"][i]["note"] if plan["rows"][i]["note"]!="OK" else "")+(" · " if plan["rows"][i]["note"] not in ("OK","") else "")+f"Topped up +{fmt(x)}h"
         def draw():
             tree.delete(*tree.get_children()); tw=lab2wk.get(tov.get())
+            over=pay_over(tw)
             for i,p in enumerate(plan["rows"]):
                 dd=day_with_date(tw,p["day"]) if p["day"] else "—"
+                note=p["note"]
+                if i in over:
+                    amt,pd=over[i]
+                    note=(f"⚠ not paid in {tw} yet" if pd<=0.01 else f"⚠ ${fmt(amt)} over pay")+("" if note=="OK" else " · "+note)
                 tree.insert("","end",iid=str(i),values=("✓" if p["use"] else "—",dd,p["worker"],p["client"],p["cat"],
-                            p["was"] or ("payroll" if p["src"]=="payroll" else "—"),f"{p['st']}–{p['et']}" if p["st"] else "—",fmt(p["hours"]),p["note"]))
+                            p["was"] or ("payroll" if p["src"]=="payroll" else "—"),f"{p['st']}–{p['et']}" if p["st"] else "—",fmt(p["hours"]),note),
+                            tags=(("danger",) if i in over and p["use"] else ()))
             n=sum(1 for p in plan["rows"] if p["use"]); hrs=sum(p["hours"] for p in plan["rows"] if p["use"]); skip=len(plan["rows"])-n
             npay=sum(1 for p in plan["rows"] if p["use"] and p["src"]=="payroll")
             if not plan["rows"]: status.config(text="Tick the clients to copy.",fg=TEXT2)
-            else: status.config(text=f"{n} shift(s), {fmt(hrs)}h will be added to {wk_label(tw)}"+(f" ({npay} from payroll)" if npay else "")
-                                +(f"  ·  {skip} left out" if skip else ""),fg=TEXT)
+            else:
+                ow={plan["rows"][i]["worker"] for i in over}
+                unpaid={plan["rows"][i]["worker"] for i,(a,pd) in over.items() if pd<=0.01}
+                status.config(text=f"{n} shift(s), {fmt(hrs)}h will be added to {wk_label(tw)}"+(f" ({npay} from payroll)" if npay else "")
+                                +(f"  ·  {skip} left out" if skip else "")
+                                +(f"  ·  ⚠ {len(ow-unpaid)} worker(s) would go over their pay" if ow-unpaid else "")
+                                +(f"  ·  ⚠ {len(unpaid)} not paid in {tw} yet" if unpaid else ""),
+                              fg=(WARNING if ow else TEXT))
             coverage()
         def coverage():
             tw=lab2wk.get(tov.get()); picked=sorted({p["client"] for p in plan["rows"]}|{c for c,v in cvars.items() if v.get()},key=str.lower)
@@ -11469,16 +11599,20 @@ class App:
             add={}
             for p in plan["rows"]:
                 if p["use"]: add[(p["client"],p["cat"])]=add.get((p["client"],p["cat"]),0.0)+p["hours"]
-            lines=[]; worst=0.0
+            lines=[]; worst=0.0; rank=[]
             for c in picked:
                 cats=[k for k in CATEGORIES if float(est.get((c,tw,k),0) or 0)>0.001 or (c,k) in add or (c,k) in have]
                 for k in cats:
                     e=float(est.get((c,tw,k),0) or 0); h=have.get((c,k),0.0); a=add.get((c,k),0.0); tot=h+a; diff=tot-e
-                    if e<=0.001: verdict="no estimate set"
-                    elif diff<-0.009: verdict=f"{fmt(-diff)}h SHORT"; worst=min(worst,diff)
-                    elif diff>0.009: verdict=f"{fmt(diff)}h over"
-                    else: verdict="covered"
-                    lines.append(f"{c[:20]:<20} {k:<14} estimate {fmt(e):>6}h  |  already {fmt(h):>6}h + copy {fmt(a):>6}h = {fmt(tot):>6}h  |  {verdict}")
+                    if e<=0.001: verdict="no estimate set"; r=2
+                    elif diff<-0.009: verdict=f"{fmt(-diff)}h SHORT"; worst=min(worst,diff); r=0
+                    elif diff>0.009: verdict=f"{fmt(diff)}h over"; r=1
+                    else: verdict="covered"; r=3
+                    rank.append((r,f"{c[:20]:<20} {k:<14} estimate {fmt(e):>6}h  |  already {fmt(h):>6}h + copy {fmt(a):>6}h = {fmt(tot):>6}h  |  {verdict}"))
+            rank.sort(key=lambda t:t[0])
+            lines=[t for r,t in rank if r<3]
+            ok_n=sum(1 for r,_t in rank if r==3)
+            if ok_n: lines.append(f"✓ {ok_n} other client/category line(s) covered")
             covlbl.config(text="\n".join(lines) or "—",fg=(DANGER if worst<-0.009 else TEXT))
         def toggle(_e=None):
             sel=tree.focus()
@@ -11500,7 +11634,7 @@ class App:
                 try: d.destroy()
                 except Exception: pass
                 self.refresh()
-                messagebox.showinfo("Copied",f"{n} shift(s) added to {wk_label(tw)}.",parent=self.root)
+                messagebox.showinfo("Copied",f"{n} shift(s) added to {wk_label(tw)}.\n\nChanged your mind? Settings & Tools › Undo a copy removes them in one go.",parent=self.root)
             def failed(exc):
                 btn.config(state="normal",text="⧉  Copy")
                 messagebox.showerror("Copy failed",str(exc),parent=d)
@@ -11508,7 +11642,7 @@ class App:
         btn=mkbtn(foot,"⧉  Copy",do_copy,PRIMARY); btn.pack(side="right",padx=(6,14),pady=8)
         def _wk_changed(*_): build_clients(); build_preview()
         fromv.trace_add("write",_wk_changed); tov.trace_add("write",lambda *_:build_preview())
-        for v in (modev,stepv,shortv): v.trace_add("write",lambda *_:build_preview())
+        for v in (modev,stepv,shortv,allow21v,skipoverv): v.trace_add("write",lambda *_:build_preview())
         build_clients(); build_preview()
 
     def delete_all_dialog(self):
@@ -11529,12 +11663,15 @@ class App:
         tk.Label(body,text="⚠ Preview — ALL of these will be permanently deleted (manual entries included):",
                  fg=DANGER,bg=BG_DARK,font=FONTB,wraplength=800,justify="left").pack(anchor="w",padx=16,pady=(6,2))
         prevwrap=tk.Frame(body,bg=BG_DARK); prevwrap.pack(fill="both",expand=True,padx=16)
-        prev_inner=self._scrollable(prevwrap)
+        # One native table, not a grid of labels: a whole period is thousands of rows and
+        # building a label for every cell took several seconds just to open this window.
+        prev_tree=make_fast_tree(prevwrap,("week","worker","client","cat","hrs","cost","src"),
+                                 ("Week","Worker","Client","Cat","Hours","Cost","Source"),
+                                 (150,150,170,60,70,90,90),("w","w","w","c","e","e","w"),height=14)
         cntlbl=tk.Label(body,text="",fg=ACCENT,bg=BG_DARK,font=FONTB); cntlbl.pack(anchor="w",padx=16,pady=(6,4))
 
         matches_holder=[[]]
         def build_preview(*_):
-            for ch in prev_inner.winfo_children(): ch.destroy()
             weeks_scope = WEEKS if fwk.get() in ("","(All weeks)") else [fwk.get()]
             matches=[]
             for wk in weeks_scope:
@@ -11545,20 +11682,12 @@ class App:
                     if fcat.get() not in ("","(All categories)") and cat!=fcat.get(): continue
                     matches.append(r)
             matches_holder[0]=matches
-            if not matches:
-                tk.Label(prev_inner,text="Nothing matches this selection.",fg=TEXT2,bg=BG_DARK,font=FONT).pack(anchor="w",pady=6)
-            else:
-                hdr=tk.Frame(prev_inner,bg=BG_DARK); hdr.pack(fill="x")
-                for t,wd in [("Week",18),("Worker",14),("Client",14),("Cat",8),("Hours",8),("Cost",10),("Source",10)]:
-                    tk.Label(hdr,text=t,fg=TEXT2,bg=BG_DARK,font=("Segoe UI",8,"bold"),width=wd,anchor="w").pack(side="left")
-                for r in matches:
-                    aid,week,worker,client,cat,hrs,rate,cost,day,note,created_by=r
-                    rw=tk.Frame(prev_inner,bg=BG_DARK); rw.pack(fill="x",pady=1)
-                    for val,wd in [(week_label_short(week),18),(worker,14),(client,14),(CAT_ABBR[cat],8),
-                                   (fmt(hrs),8),("$"+fmt(cost),10),(note or "manual",10)]:
-                        tk.Label(rw,text=val,fg=TEXT,bg=BG_DARK,font=("Segoe UI",9),width=wd,anchor="w").pack(side="left")
+            wl={wk:week_label_short(wk) for wk in WEEKS}
+            self._tree_replace(prev_tree,[(None,(wl.get(r[1],r[1]),r[2],r[3],CAT_ABBR.get(r[4],r[4]),fmt(r[5]),"$"+fmt(r[7]),r[9] or "manual"),
+                                           ("odd" if i%2 else "even",)) for i,r in enumerate(matches)])
             th=sum(r[5] for r in matches); tc=sum(r[7] for r in matches)
-            cntlbl.config(text=f"{len(matches)} allocation(s) match — {fmt(th)} hours, ${fmt(tc)} total.")
+            cntlbl.config(text=(f"{len(matches)} allocation(s) match — {fmt(th)} hours, ${fmt(tc)} total." if matches
+                                else "Nothing matches this selection."))
         for v in (fwk,fw,fcli,fcat): v.trace_add("write",build_preview)
 
         def do_delete():
@@ -13265,22 +13394,27 @@ class App:
         cv.create_window((0,0),window=inner,anchor="nw"); cv.configure(yscrollcommand=sb.set)
         cv.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
         tk.Label(inner,text=f"📄 {week_label(wk)} Report",fg=ACCENT,bg=BG_DARK,font=("Segoe UI",15,"bold")).pack(anchor="w",padx=16,pady=12)
+        # Everything below comes from the in-memory period (the same figures the database
+        # holds) instead of ~5,000 one-value queries, one per client/category/worker.
+        snap=self._snapshot; der=self._derived
+        clients=list(snap.get("clients",[])); workers=list(snap.get("workers",[]))
+        def period_left(c,cat): return float(snap["period"].get((c,cat),0.0) or 0.0)-der["client_period_alloc"].get((c,cat),0.0)
         # exceptions strip
         exc=[]
-        for c in list_clients():
+        for c in clients:
             for cat in CATEGORIES:
-                lh=client_period_left(c,cat)
+                lh=period_left(c,cat)
                 if lh>1e-9: exc.append(f"{c} {CAT_ABBR[cat]}: {fmt(lh)}h left (period)")
         if exc:
             eb=tk.Frame(inner,bg=BG_PANEL); eb.pack(fill="x",padx=16,pady=6)
             tk.Label(eb,text="⚠ Needs attention",fg=WARNING,bg=BG_PANEL,font=FONTB).pack(anchor="w",padx=10,pady=4)
             tk.Label(eb,text="   "+"   |   ".join(exc),fg=TEXT,bg=BG_PANEL,font=FONT,justify="left",wraplength=820).pack(anchor="w",padx=10,pady=(0,6))
         cat_tot={cat:0 for cat in CATEGORIES}
-        for c in list_clients():
+        for c in clients:
             box=tk.Frame(inner,bg=BG_PANEL); box.pack(fill="x",padx=16,pady=6)
             tk.Label(box,text=f"🏢 {c}",fg=ACCENT,bg=BG_PANEL,font=("Segoe UI",12,"bold")).pack(anchor="w",padx=10,pady=(8,2))
             for cat in CATEGORIES:
-                est=get_client_estimate(c,wk,cat); placed=client_allocated(c,wk,cat); left=client_period_left(c,cat)
+                est=float(snap["estimates"].get((c,wk,cat),0.0) or 0.0); placed=der["client_week_alloc"].get((c,wk,cat),0.0); left=period_left(c,cat)
                 cat_tot[cat]+=placed
                 col=DANGER if left<-1e-9 else (SUCCESS if abs(left)<1e-9 else TEXT)
                 tk.Label(box,text=f"   {CAT_ABBR[cat]}:   {wk} est {fmt(est)}  ·  placed this wk {fmt(placed)}  ·  period left {fmt(left)}",
@@ -13291,8 +13425,8 @@ class App:
         tk.Label(tb,text="   "+"    ".join(f"{CAT_ABBR[cat]}: {fmt(cat_tot[cat])}h" for cat in CATEGORIES),fg=TEXT,bg=BG_DARK,font=FONT).pack(anchor="w",pady=4)
         # worker side
         tk.Label(inner,text="WORKERS this week",fg=ACCENT,bg=BG_DARK,font=FONTB).pack(anchor="w",padx=16,pady=(10,2))
-        for w in list_workers():
-            start=get_worker_wage_start(w,wk); left=worker_wage_left(w,wk)
+        for w in workers:
+            start=float(snap["wages"].get((w,wk),0.0) or 0.0); left=start-der["worker_week_alloc"].get((w,wk),0.0)
             tk.Label(inner,text=f"   {w}:  ${fmt(start)} start  →  ${fmt(left)} left  (placed ${fmt(start-left)})",
                      fg=TEXT,bg=BG_DARK,font=FONT).pack(anchor="w",padx=16,pady=1)
 
@@ -17364,7 +17498,10 @@ def _rev_bucket_days(bucket):
 # Victorian public holidays (a weekday / weekend invoice line never gets hours on these days)
 REV_VIC_PH={_date(*t) for t in [(2024,12,25),(2024,12,26),
     (2025,1,1),(2025,1,27),(2025,3,10),(2025,4,18),(2025,4,19),(2025,4,20),(2025,4,21),(2025,4,25),(2025,6,9),(2025,9,26),(2025,11,4),(2025,12,25),(2025,12,26),
-    (2026,1,1),(2026,1,26),(2026,3,9),(2026,4,3),(2026,4,4),(2026,4,5),(2026,4,6),(2026,4,25),(2026,6,8),(2026,9,25),(2026,11,3),(2026,12,25),(2026,12,26),(2026,12,28)]}
+    (2026,1,1),(2026,1,26),(2026,3,9),(2026,4,3),(2026,4,4),(2026,4,5),(2026,4,6),(2026,4,25),(2026,6,8),(2026,9,25),(2026,11,3),(2026,12,25),(2026,12,26),(2026,12,28),
+    # 2027 — the Friday before the AFL Grand Final is not declared yet: add it when announced.
+    (2027,1,1),(2027,1,26),(2027,3,8),(2027,3,26),(2027,3,27),(2027,3,28),(2027,3,29),(2027,4,25),(2027,6,14),(2027,11,2),
+    (2027,12,25),(2027,12,26),(2027,12,27),(2027,12,28)]}
 
 REV_LATE_RE=re.compile(r"night|evening|overnight",re.I)
 REV_LATE_START=18*60
