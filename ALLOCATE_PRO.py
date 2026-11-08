@@ -6039,7 +6039,7 @@ class App:
         try: self.root.destroy()
         except Exception: pass
 
-    def publish_update_dialog(self):
+    def publish_update_dialog(self,path=None):
         if self.role!="manager":
             messagebox.showinfo("Managers only","Only a manager can publish an update.",parent=self.root); return
         L=_ap_launcher()
@@ -6072,6 +6072,8 @@ class App:
         def pick():
             p=filedialog.askopenfilename(parent=d,title="Choose the new ALLOCATE_PRO.py",filetypes=[("Allocate Pro","*.py"),("All files","*.*")])
             if not p: return
+            load(p)
+        def load(p):
             try: code=open(p,"r",encoding="utf-8").read()
             except Exception as exc: messagebox.showerror("Can't read",str(exc),parent=d); return
             v=code_version(code)
@@ -6105,6 +6107,64 @@ class App:
                 status.config(text=f"Not published: {exc}",fg=DANGER); pub.config(state="normal",text="⇪  Publish to everyone")
             self._background_job(work,done,fail,label="publish_update")
         pub=mkbtn(body,"⇪  Publish to everyone",go,PRIMARY); pub.pack(anchor="e",padx=20,pady=10); pub.config(state="disabled")
+        if path:
+            # Opened from the "new version in your Updates folder" banner: file and notes ready.
+            load(path)
+            try:
+                wn=os.path.join(os.path.dirname(path),"WHATS_NEW.txt")
+                if os.path.exists(wn):
+                    with open(wn,"r",encoding="utf-8") as fh: notev.set(" ".join(fh.read().split())[:300])
+            except Exception: pass
+
+    # ---- new versions dropped into the Updates folder are offered for publishing ----
+    def _updates_folder(self):
+        return load_monday_cfg().get("updates_folder") or os.path.join(os.path.expanduser("~"),"Allocate Pro","Updates")
+
+    def _scan_updates_folder(self):
+        """Newest ALLOCATE_PRO*.py in the Updates folder (and its sub-folders) that is newer
+        than this version and than what's already published, or None."""
+        root=self._updates_folder()
+        if not os.path.isdir(root): return None
+        floor=APP_VERSION
+        try:
+            latest=latest_published_update()
+            if latest and version_tuple(latest[0])>version_tuple(floor): floor=latest[0]
+        except Exception: pass
+        best=None
+        for dirpath,dirnames,files in os.walk(root):
+            if dirpath.count(os.sep)-root.count(os.sep)>=2: dirnames[:]=[]
+            for f in files:
+                if not (f.lower().startswith("allocate_pro") and f.lower().endswith(".py")): continue
+                pth=os.path.join(dirpath,f)
+                try:
+                    with open(pth,"r",encoding="utf-8") as fh: v=code_version(fh.read(8192))
+                except Exception: v=None
+                if v and version_tuple(v)>version_tuple(floor) and (best is None or version_tuple(v)>version_tuple(best[0])):
+                    best=(v,pth)
+        return best
+
+    def _update_folder_tick(self):
+        """Every few minutes on a PC that can publish: offer a newer version found in the
+        Updates folder with a one-click 'Publish to everyone' bar."""
+        try: self.root.after(120000,self._update_folder_tick)
+        except Exception: pass
+        if self.role!="manager" or not update_can_publish(): return
+        def shown(found):
+            if not found or getattr(self,"_upd_folder_seen",None)==found[0]: return
+            self._upd_folder_seen=found[0]; v,pth=found
+            try:
+                if getattr(self,"_updf_bar",None) is not None: self._updf_bar.destroy()
+            except Exception: pass
+            bar=tk.Frame(self.main,bg=_mix_hex(CARD,PRIMARY,0.16),highlightbackground=PRIMARY,highlightthickness=1)
+            first=self.main.winfo_children()[0] if self.main.winfo_children() else None
+            bar.pack(fill="x",before=first) if first is not None and first is not bar else bar.pack(fill="x")
+            self._updf_bar=bar
+            tk.Label(bar,text=f"⇪  Allocate Pro {v} is in your Updates folder — publish it to every PC?",fg=TEXT,bg=bar.cget("bg"),
+                     font=("Segoe UI Semibold",ui_pt(9),"bold"),anchor="w").pack(side="left",padx=12,pady=6)
+            tk.Button(bar,text="Later",command=bar.destroy,bg=CONTROL,fg=TEXT,relief="flat",bd=0,cursor="hand2",padx=10,pady=3).pack(side="right",padx=(4,10),pady=4)
+            tk.Button(bar,text="⇪  Publish to everyone…",command=lambda:(bar.destroy(),self.publish_update_dialog(path=pth)),bg=PRIMARY,fg="#fff",
+                      relief="flat",bd=0,cursor="hand2",font=("Segoe UI Semibold",ui_pt(9),"bold"),padx=12,pady=3).pack(side="right",pady=4)
+        self._run_off_ui(self._scan_updates_folder,shown,lambda exc:None)
 
 
     # ================= DIRECTORY (12.0) =================
@@ -19665,6 +19725,8 @@ def main():
     def start(username,role):
         root.deiconify(); app=App(root,username,role)
         try: root.after(2500,app._monday_banner_check)
+        except Exception: pass
+        try: root.after(6000,app._update_folder_tick)
         except Exception: pass
         try: app._update_start_checks()
         except Exception: pass
