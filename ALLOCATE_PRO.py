@@ -11704,9 +11704,53 @@ class App:
             try: return f"{wk} · {fmt_date(get_week_date(wk))}"
             except Exception: return wk
         labels=[wk_label(w) for w in WEEKS]; lab2wk=dict(zip(labels,WEEKS))
+        # TO can also be a week of a LATER period (e.g. Week 1 of the next period): each
+        # entry -> (period path or None for this one, week, week-ending iso, period name)
+        tlabels=list(labels); tlab={l:(None,w,get_week_date(w),"") for l,w in zip(labels,WEEKS)}
+        try:
+            last=parse_week_date(get_week_date(WEEKS[-1]))
+            later=[]
+            for pname,ppath in list_periods():
+                if ppath==DB_PATH: continue
+                try: wks=scan_period_weeks(ppath,pname)
+                except Exception: continue
+                for x in wks:
+                    if x["date"] and last and x["date"]>last: later.append((x["date"],pname,ppath,x["wk"],x["iso"]))
+            for dt_,pname,ppath,wk_,iso in sorted(later)[:12]:
+                l=f"{pname} · {wk_} · {dt_.strftime('%d %b %Y')}"
+                tlabels.append(l); tlab[l]=(ppath,wk_,iso,pname)
+        except Exception:
+            pass
+        T={"path":"?","snap":snap,"wk":None,"iso":"","name":""}
+        _tcache={}
+        def target():
+            """Point T at the chosen TO week; another period's data is read once, read-only."""
+            path,wk_,iso,pname=tlab.get(tov.get(),(None,None,"",""))
+            if path!=T["path"]:
+                if path is None: T["snap"]=snap
+                else:
+                    if path not in _tcache:
+                        try: _tcache[path]=load_period_snapshot_at(path)
+                        except Exception: _tcache[path]=None
+                    T["snap"]=_tcache[path] or {"allocations":[],"cmv_info":[],"wages":{},"estimates":{},"worker_rates":{},"clients":[],"workers":[]}
+                T["path"]=path
+            T["wk"]=wk_; T["iso"]=iso; T["name"]=pname
+            return wk_
+        def tsnap(): return T["snap"]
+        def t_end(): return parse_week_date(T["iso"]) if T["iso"] else None
+        def t_label(): return (f"{T['name']} · " if T["path"] else "")+f"{T['wk']} · {fmt_date(T['iso'])}"
+        def t_day(day):
+            dd=day_date_for(t_end(),day) if day else None
+            return f"{day} · {dd.strftime('%d %b')}" if dd else (day or "—")
+        def t_rate(w,cat,wrates):
+            try: return effective_rate(w,cat,wrates,on=t_end())
+            except Exception: return GLOBAL_RATES.get(cat,0)
         cur=self.cur_week.get() if hasattr(self,"cur_week") else WEEKS[0]
         i0=WEEKS.index(cur) if cur in WEEKS else 0
-        fromv=tk.StringVar(value=labels[i0]); tov=tk.StringVar(value=labels[min(i0+1,len(WEEKS)-1)])
+        fromv=tk.StringVar(value=labels[i0])
+        # the week after FROM: the next week here, or Week 1 of the next period after Week 6
+        nxt=labels[i0+1] if i0+1<len(WEEKS) else (tlabels[len(WEEKS)] if len(tlabels)>len(WEEKS) else labels[-1])
+        tov=tk.StringVar(value=nxt)
         modev=tk.StringVar(value="exact"); stepv=tk.StringVar(value="15")
         payv=tk.BooleanVar(value=True); shortv=tk.StringVar(value="leave")
         CK=dict(fg=TEXT,bg=CARD,selectcolor=BG_LIGHT,activebackground=CARD,activeforeground=TEXT,font=FONT)
@@ -11714,7 +11758,7 @@ class App:
         tk.Label(top,text="FROM",fg=TEXT2,bg=CARD,font=("Segoe UI Semibold",8,"bold")).pack(side="left",padx=(12,5),pady=10)
         ttk.Combobox(top,textvariable=fromv,values=labels,state="readonly",width=24,style="Modern.TCombobox").pack(side="left")
         tk.Label(top,text="  TO",fg=TEXT2,bg=CARD,font=("Segoe UI Semibold",8,"bold")).pack(side="left",padx=(12,5))
-        ttk.Combobox(top,textvariable=tov,values=labels,state="readonly",width=24,style="Modern.TCombobox").pack(side="left")
+        ttk.Combobox(top,textvariable=tov,values=tlabels,state="readonly",width=40,style="Modern.TCombobox").pack(side="left")
         tk.Checkbutton(top,text="Payroll shifts of the TO week go in first",variable=payv,command=lambda:build_preview(),**CK).pack(side="left",padx=(18,6))
         mode=tk.Frame(body,bg=CARD,highlightbackground=BORDER,highlightthickness=1); mode.pack(fill="x",padx=16,pady=(0,6))
         tk.Radiobutton(mode,text="Copy exactly",variable=modev,value="exact",**CK).pack(side="left",padx=(12,8),pady=6)
@@ -11795,7 +11839,7 @@ class App:
             """Payroll client text ('Havva Cokacar-CO-CM025') -> the Allocate Pro client ('Hava')."""
             name=re.split(r"-(?:CO|SC)-",str(raw or ""),maxsplit=1,flags=re.I)[0].strip()
             if not name or name.lower().startswith("general admin"): return None
-            clients=list(snap.get("clients",[])) or sorted({r[3] for r in snap.get("allocations",[])})
+            ts=tsnap(); clients=list(ts.get("clients",[]) or snap.get("clients",[])) or sorted({r[3] for r in ts.get("allocations",[])})
             low={c.lower():c for c in clients}
             if name.lower() in low: return low[name.lower()]
             first=name.split()[0].lower()
@@ -11811,7 +11855,7 @@ class App:
             return None
         def payroll_rows(tw,picked):
             out=[]
-            for r in snap.get("cmv_info",[]) or []:
+            for r in tsnap().get("cmv_info",[]) or []:
                 # (id,week,worker,source_worker,work_date,day,client,service,hours,start,end,status,...)
                 if r[1]!=tw or str(r[11] or "").strip().lower() in ("rejected","cancelled","canceled","declined"): continue
                 c=map_client(r[6])
@@ -11830,7 +11874,7 @@ class App:
             """Category for a shift on `day` of week tw: a Victorian public holiday that day
             makes it Public Holiday; a Public Holiday shift copied onto an ordinary day goes
             back to Weekday/Saturday/Sunday. Returns (category, note or "")."""
-            try: dd=day_date_for(parse_week_date(get_week_date(tw)),day) if day else None
+            try: dd=day_date_for(t_end(),day) if day else None
             except Exception: dd=None
             if dd and dd in REV_VIC_PH: return "Public Holiday",("" if cat=="Public Holiday" else f"Public holiday {dd.strftime('%d %b')} — PH rate")
             if cat=="Public Holiday": return _CAT_OF_DAY.get(day,"Weekday"),"Not a public holiday in this week"
@@ -11839,15 +11883,15 @@ class App:
             import random as _rnd
             if new_seed: plan["seed"]+=1
             rng=_rnd.Random(plan["seed"])
-            fw=lab2wk.get(fromv.get()); tw=lab2wk.get(tov.get())
+            fw=lab2wk.get(fromv.get()); tw=target()
             tree.delete(*tree.get_children()); plan["rows"]=[]
-            if fw==tw:
+            if fw==tw and T["path"] is None:
                 status.config(text="Pick two different weeks.",fg=WARNING); covlbl.config(text=""); return
             picked={c for c,v in cvars.items() if v.get()}
             vary=modev.get()=="vary"; step=int(stepv.get() or 15)
             busy={}            # day -> [[worker, client, a, b, plan_idx or None]]
             existing=[]
-            for r in snap.get("allocations",[]):
+            for r in tsnap().get("allocations",[]):
                 if r[1]!=tw: continue
                 st=(r[12] if len(r)>12 else "") or ""; et=(r[13] if len(r)>13 else "") or ""
                 existing.append((r[2],r[3],r[8] or "",span(st,et)))
@@ -11861,7 +11905,7 @@ class App:
             def add(p):
                 plan["rows"].append(p); return len(plan["rows"])-1
             # every payroll shift of the TO week (any client) blocks that worker's time
-            for r in snap.get("cmv_info",[]) or []:
+            for r in tsnap().get("cmv_info",[]) or []:
                 if r[1]!=tw or str(r[11] or "").strip().lower() in ("rejected","cancelled","canceled","declined"): continue
                 sp=span(r[9] or "",r[10] or ""); day=r[5] or ""; mc=map_client(r[6])
                 if payv.get() and mc in picked: continue          # added (and checked) just below
@@ -11920,36 +11964,33 @@ class App:
         def pay_over(tw,only_used=True):
             """Rows (in plan order) that take their worker past what they were paid in week tw.
             Returns {row index: (amount over after this row, paid)}."""
-            wrates=snap.get("worker_rates",{}) or {}
-            paid={w:float(v or 0) for (w,wk),v in (snap.get("wages",{}) or {}).items() if wk==tw}
+            ts=tsnap(); wrates=ts.get("worker_rates",{}) or {}
+            paid={w:float(v or 0) for (w,wk),v in (ts.get("wages",{}) or {}).items() if wk==tw}
             used={}
-            for r in snap.get("allocations",[]):
+            for r in ts.get("allocations",[]):
                 if r[1]==tw: used[r[2]]=used.get(r[2],0.0)+float(r[7] or 0)
             out={}
             for i,p in enumerate(plan["rows"]):
                 if only_used and not p["use"]: continue
-                try: rate=effective_rate(p["worker"],p["cat"],wrates,week=tw)
-                except Exception: rate=GLOBAL_RATES.get(p["cat"],0)
+                rate=t_rate(p["worker"],p["cat"],wrates)
                 used[p["worker"]]=used.get(p["worker"],0.0)+p["hours"]*rate
                 over=used[p["worker"]]-paid.get(p["worker"],0.0)
                 if over>0.01: out[i]=(over,paid.get(p["worker"],0.0))
             return out
         def top_up(tw,busy,clash):
-            est=snap.get("estimates",{}) or {}; wrates=snap.get("worker_rates",{}) or {}
+            ts=tsnap(); est=ts.get("estimates",{}) or {}; wrates=ts.get("worker_rates",{}) or {}
             have={}
-            for r in snap.get("allocations",[]):
+            for r in ts.get("allocations",[]):
                 if r[1]==tw: have[(r[3],r[4])]=have.get((r[3],r[4]),0.0)+float(r[5] or 0)
             for p in plan["rows"]:
                 if p["use"]: have[(p["client"],p["cat"])]=have.get((p["client"],p["cat"]),0.0)+p["hours"]
             # wage left in the TO week per worker, after what is already there and this plan
             wl={}
-            for (w,wk),v in (snap.get("wages",{}) or {}).items():
+            for (w,wk),v in (ts.get("wages",{}) or {}).items():
                 if wk==tw: wl[w]=float(v or 0)
-            for r in snap.get("allocations",[]):
+            for r in ts.get("allocations",[]):
                 if r[1]==tw: wl[r[2]]=wl.get(r[2],0.0)-float(r[7] or 0)
-            def rate(w,cat):
-                try: return effective_rate(w,cat,wrates,week=tw)
-                except Exception: return GLOBAL_RATES.get(cat,0)
+            def rate(w,cat): return t_rate(w,cat,wrates)
             for p in plan["rows"]:
                 if p["use"]: wl[p["worker"]]=wl.get(p["worker"],0.0)-p["hours"]*rate(p["worker"],p["cat"])
             def day_minutes(w,day):
@@ -11978,10 +12019,10 @@ class App:
                 for i,x in added.items():
                     if x>0: plan["rows"][i]["note"]=(plan["rows"][i]["note"] if plan["rows"][i]["note"]!="OK" else "")+(" · " if plan["rows"][i]["note"] not in ("OK","") else "")+f"Topped up +{fmt(x)}h"
         def draw():
-            tree.delete(*tree.get_children()); tw=lab2wk.get(tov.get())
+            tree.delete(*tree.get_children()); tw=target()
             over=pay_over(tw)
             for i,p in enumerate(plan["rows"]):
-                dd=day_with_date(tw,p["day"]) if p["day"] else "—"
+                dd=t_day(p["day"]) if p["day"] else "—"
                 note=p["note"]
                 if i in over:
                     amt,pd=over[i]
@@ -11995,18 +12036,18 @@ class App:
             else:
                 ow={plan["rows"][i]["worker"] for i in over}
                 unpaid={plan["rows"][i]["worker"] for i,(a,pd) in over.items() if pd<=0.01}
-                status.config(text=f"{n} shift(s), {fmt(hrs)}h will be added to {wk_label(tw)}"+(f" ({npay} from payroll)" if npay else "")
+                status.config(text=f"{n} shift(s), {fmt(hrs)}h will be added to {t_label()}"+(f" ({npay} from payroll)" if npay else "")
                                 +(f"  ·  {skip} left out" if skip else "")
                                 +(f"  ·  ⚠ {len(ow-unpaid)} worker(s) would go over their pay" if ow-unpaid else "")
                                 +(f"  ·  ⚠ {len(unpaid)} not paid in {tw} yet" if unpaid else ""),
                               fg=(WARNING if ow else TEXT))
             coverage()
         def coverage():
-            tw=lab2wk.get(tov.get()); picked=sorted({p["client"] for p in plan["rows"]}|{c for c,v in cvars.items() if v.get()},key=str.lower)
+            tw=target(); picked=sorted({p["client"] for p in plan["rows"]}|{c for c,v in cvars.items() if v.get()},key=str.lower)
             if not picked: covlbl.config(text="Tick a client to see it.",fg=TEXT2); return
-            est=snap.get("estimates",{}) or {}
+            est=tsnap().get("estimates",{}) or {}
             have={}
-            for r in snap.get("allocations",[]):
+            for r in tsnap().get("allocations",[]):
                 if r[1]==tw: have[(r[3],r[4])]=have.get((r[3],r[4]),0.0)+float(r[5] or 0)
             add={}
             for p in plan["rows"]:
@@ -12035,9 +12076,9 @@ class App:
         def do_copy():
             rows=[p for p in plan["rows"] if p["use"]]
             if not rows: messagebox.showwarning("Nothing to copy","Tick at least one client (and leave at least one row in).",parent=d); return
-            fw=lab2wk.get(fromv.get()); tw=lab2wk.get(tov.get())
+            fw=lab2wk.get(fromv.get()); tw=target(); tpath=T["path"]; tl=t_label()
             npay=sum(1 for p in rows if p["src"]=="payroll")
-            if not messagebox.askyesno("Copy shifts",f"Add {len(rows)} shift(s) ({fmt(sum(p['hours'] for p in rows))}h) to {wk_label(tw)}?"
+            if not messagebox.askyesno("Copy shifts",f"Add {len(rows)} shift(s) ({fmt(sum(p['hours'] for p in rows))}h) to {tl}?"
                                        +(f"\n{npay} of them are the payroll shifts of that week." if npay else "")
                                        +f"\n\nCopied from {wk_label(fw)}. Nothing in {fw} changes.",parent=d): return
             data=[(tw,p["worker"],p["client"],p["cat"],p["hours"],p["day"],("From payroll" if p["src"]=="payroll" else f"Copied from {fw}"),p["st"],p["et"]) for p in rows]
@@ -12046,11 +12087,17 @@ class App:
                 try: d.destroy()
                 except Exception: pass
                 self.refresh()
-                messagebox.showinfo("Copied",f"{n} shift(s) added to {wk_label(tw)}.\n\nChanged your mind? Settings & Tools › Undo a copy removes them in one go.",parent=self.root)
+                messagebox.showinfo("Copied",f"{n} shift(s) added to {tl}."
+                                    +("\n\nOpen that period (PERIOD button at the top) to see them." if tpath else "")
+                                    +"\n\nChanged your mind? Settings & Tools › Undo a copy removes them in one go"
+                                    +(" (with that period open)." if tpath else "."),parent=self.root)
             def failed(exc):
                 btn.config(state="normal",text="⧉  Copy")
                 messagebox.showerror("Copy failed",str(exc),parent=d)
-            self._background_job(lambda:save_allocations_batch(data,self.user),done,failed,sync_after=True,label="copy_week")
+            if tpath:
+                self._background_job(lambda:save_allocations_to_period(tpath,data,self.user),done,failed,label="copy_week_to_period")
+            else:
+                self._background_job(lambda:save_allocations_batch(data,self.user),done,failed,sync_after=True,label="copy_week")
         btn=mkbtn(foot,"⧉  Copy",do_copy,PRIMARY); btn.pack(side="right",padx=(6,14),pady=8)
         def _wk_changed(*_): build_clients(); build_preview()
         fromv.trace_add("write",_wk_changed); tov.trace_add("write",lambda *_:build_preview())
@@ -19739,6 +19786,70 @@ def guide_weekly_plans(guides,weeks=None):
                     h=guide_week_hours(g,cat)
                 out.append((c,wk,cat,round(h,2)))
     return out
+
+def load_period_snapshot_at(path):
+    """Like load_period_snapshot, for ANY period file (read only), plus its week dates."""
+    if CLOUD_ENABLED and path!=DEFAULT_DB_PATH:
+        try: archive_fetch_if_newer(path)
+        except Exception: pass
+    con=_report_connect(path)
+    try:
+        q=lambda sql:_safe_rows(con,sql)
+        meta=dict(q("SELECT k,v FROM meta"))
+        snap={"workers":[r[0] for r in q("SELECT name FROM workers ORDER BY rowid")],
+              "clients":[r[0] for r in q("SELECT name FROM clients ORDER BY rowid")],
+              "wages":{(w,wk):float(v or 0) for w,wk,v in q("SELECT worker,week,wage FROM worker_week")},
+              "worker_rates":{(w,c):float(r or 0) for w,c,r in q("SELECT worker,category,rate FROM worker_rate")},
+              "estimates":{(c,wk,cat):float(h or 0) for c,wk,cat,h in q("SELECT client,week,category,hours FROM client_estimate")},
+              "allocations":q("SELECT id,week,worker,client,category,hours,rate,cost,day,note,created_by,created,start_time,end_time FROM allocations ORDER BY id"),
+              "cmv_info":q("SELECT id,week,worker,source_worker,work_date,day,client,service,hours,start_time,end_time,status,source_note,source_file,imported_at FROM cmv_week_info"),
+              "week_dates":{wk:meta.get("date_"+wk) or DEFAULT_WEEK_DATES[i] for i,wk in enumerate(WEEKS)}}
+    finally:
+        con.close()
+    return snap
+
+def save_allocations_to_period(path,rows,user="system"):
+    """save_allocations_batch for ANY period file (e.g. Week 1 of the next period).
+    rows: (week,worker,client,category,hours,day,note,start_time,end_time). Workers and
+    clients missing from that period are added; rates follow THAT period's dates."""
+    rows=[r for r in (rows or []) if float(r[4] or 0)>0]
+    if not rows: return 0
+    con,after=_period_rw(path)
+    try:
+        try: ensure_period_schema(path) if path!=DEFAULT_DB_PATH else None
+        except Exception: pass
+        meta=dict(_safe_rows(con,"SELECT k,v FROM meta"))
+        ends={wk:parse_week_date(meta.get("date_"+wk) or DEFAULT_WEEK_DATES[i]) for i,wk in enumerate(WEEKS)}
+        wrates={(w,c):float(r) for w,c,r in _safe_rows(con,"SELECT worker,category,rate FROM worker_rate")}
+        have_w={r[0] for r in _safe_rows(con,"SELECT name FROM workers")}; have_c={r[0] for r in _safe_rows(con,"SELECT name FROM clients")}
+        for w in sorted({r[1] for r in rows}-have_w):
+            con.execute("INSERT OR IGNORE INTO workers(name) VALUES(?)",(w,))
+            for wk in WEEKS: con.execute("INSERT OR IGNORE INTO worker_week(worker,week,wage) VALUES(?,?,0)",(w,wk))
+        for c in sorted({r[2] for r in rows}-have_c):
+            con.execute("INSERT OR IGNORE INTO clients(name) VALUES(?)",(c,))
+            for cat in CATEGORIES: con.execute("INSERT OR IGNORE INTO client_period(client,category,hours) VALUES(?,?,0)",(c,cat))
+        now=datetime.now().isoformat(timespec="seconds"); cells=set()
+        for week,worker,client,cat,hours,day,note,st,et in rows:
+            hours=float(hours); d=day_date_for(ends.get(week),day) if day else ends.get(week)
+            rate=effective_rate(worker,cat,wrates,on=d); cost=hours*rate
+            con.execute("""INSERT INTO allocations(week,worker,client,category,hours,rate,cost,day,note,created_by,created,start_time,end_time)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",(week,worker,client,cat,hours,rate,cost,day or "",note or "",user,now,st or "",et or ""))
+            cells.add((client,week,cat))
+        for c,wk,cat in cells:
+            try: _sync_estimate_to_allocated(con,c,wk,cat)
+            except Exception: pass
+        try: audit_write("ADD","allocations","batch","","",str(len(rows)),f"{len(rows)} allocations copied in from another period",user,con)
+        except Exception: pass
+        _touch(con); con.commit()
+    except Exception:
+        try: con.rollback()
+        except Exception: pass
+        raise
+    finally:
+        con.close()
+    try: after()
+    except Exception: pass
+    return len(rows)
 
 def main():
     # FAST START: show login before any cloud/database bootstrap.
