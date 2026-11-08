@@ -67,4 +67,13 @@ g=_ap.App._roster_cmv_ghosts(fake,"Week 1")
 got=sorted((x["day"],x["client"],x["hours"],x["start"],x["end"],x["partial"]) for x in g)
 assert got==[("Thursday","Harbour View",2.0,"12:00","14:00",True),("Tuesday","Pine Lodge",3.0,"09:00","12:00",False)], got
 print("roster CareMile ghosts ok")
+# 9. CareMile client names resolve to ONE client, or none when unsure (Monday auto-import)
+cl=["Client 05 Jones","Client 15 Jones","Stephanie","Hava","Sarah Ali","Sarah Brown","Wafaa"]
+R=_ap.cmv_resolve_client
+assert R("Client 05 Jones-CO-CM001",cl)=="Client 05 Jones"
+assert R("Stephanie Pickett-CO-CM017",cl)=="Stephanie"
+assert R("Havva Cokacar-CO-CM025",cl)=="Hava"
+assert R("Sarah Smith-CO-CM1",cl) is None          # two Sarahs: never guess
+assert R("Nobody Here-CO-CM9",cl) is None
+print("CareMile client resolving ok")
 print("ALL TESTS PASSED")

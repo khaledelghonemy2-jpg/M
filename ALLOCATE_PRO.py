@@ -5682,6 +5682,139 @@ class App:
         tk.Button(bar,text="↻  Restart now",command=self._update_restart,bg=SUCCESS,fg="#fff",relief="flat",bd=0,cursor="hand2",
                   font=("Segoe UI Semibold",ui_pt(9),"bold"),padx=12,pady=3).pack(side="right",pady=4)
 
+    # ---------------- Monday auto-import ----------------
+    MONDAY_TASK_NAME="Allocate Pro Monday import"
+
+    def _monday_command(self):
+        """The command Task Scheduler runs: this program with --monday-run."""
+        if getattr(sys,"frozen",False):
+            return f'"{sys.executable}" --monday-run'
+        exe=sys.executable
+        pyw=os.path.join(os.path.dirname(exe),"pythonw.exe")
+        if os.path.exists(pyw): exe=pyw
+        return f'"{exe}" "{os.path.abspath(__file__)}" --monday-run'
+
+    def _schtasks(self,args):
+        if os.name!="nt": raise RuntimeError("The weekly schedule uses Windows Task Scheduler — run this on the Windows PC that should do the Monday import.")
+        r=_subprocess.run(["schtasks"]+args,capture_output=True,text=True,creationflags=getattr(_subprocess,"CREATE_NO_WINDOW",0))
+        if r.returncode!=0: raise RuntimeError((r.stderr or r.stdout or "schtasks failed").strip())
+        return (r.stdout or "").strip()
+
+    def monday_dialog(self):
+        d,body=branded_dialog(self.root,"Monday auto-import",
+            "Every Monday this PC picks up the newest weekly wages file from a folder, imports it into the right week, "
+            "allocates the CareMile shifts, then copies last week's shifts — never over anyone's pay. Everything it adds can be undone in one go.",
+            880,640)
+        cfg=load_monday_cfg()
+        CK=dict(fg=TEXT,bg=CARD,font=FONT)
+        box=tk.Frame(body,bg=CARD,highlightbackground=BORDER,highlightthickness=1); box.pack(fill="x",padx=16,pady=(12,6))
+        tk.Label(box,text="WAGES FOLDER",fg=TEXT2,bg=CARD,font=("Segoe UI Semibold",8,"bold")).grid(row=0,column=0,sticky="w",padx=12,pady=(10,2))
+        folderv=tk.StringVar(value=cfg.get("folder",""))
+        tk.Entry(box,textvariable=folderv,bg=BG_LIGHT,fg=TEXT,insertbackground=TEXT,relief="flat",font=FONT).grid(row=1,column=0,sticky="ew",padx=12,pady=(0,10),ipady=5)
+        def browse():
+            pth=filedialog.askdirectory(parent=d,initialdir=folderv.get() or None)
+            if pth: folderv.set(pth); save()
+        mkbtn(box,"Browse…",browse,CONTROL,fg=TEXT).grid(row=1,column=1,padx=(0,12),pady=(0,10))
+        tk.Label(box,text="EVERY MONDAY AT",fg=TEXT2,bg=CARD,font=("Segoe UI Semibold",8,"bold")).grid(row=0,column=2,sticky="w",padx=12,pady=(10,2))
+        timev=tk.StringVar(value=cfg.get("time","10:00"))
+        ttk.Combobox(box,textvariable=timev,values=[f"{h:02d}:{m:02d}" for h in range(6,19) for m in (0,30)],state="readonly",width=7,
+                     style="Modern.TCombobox").grid(row=1,column=2,sticky="w",padx=12,pady=(0,10))
+        box.grid_columnconfigure(0,weight=1)
+        stat=tk.Label(body,text="",fg=TEXT2,bg=BG_DARK,font=FONT,justify="left",anchor="w",wraplength=820); stat.pack(fill="x",padx=18,pady=(4,2))
+        def save():
+            cfg.update(folder=folderv.get().strip(),time=timev.get()); save_monday_cfg(cfg); show_state()
+        def show_state():
+            on=cfg.get("enabled")
+            stat.config(text=(f"● Scheduled: every Monday at {cfg.get('time')} on this PC (it must be switched on and signed in)."
+                              if on else "○ Not scheduled on this PC yet."),fg=(SUCCESS if on else TEXT2))
+        timev.trace_add("write",lambda *_:save())
+        btns=tk.Frame(body,bg=BG_DARK); btns.pack(fill="x",padx=16,pady=6)
+        out=tk.Text(body,height=12,bg=CARD,fg=TEXT,relief="flat",font=("Segoe UI",ui_pt(9)),wrap="word",highlightthickness=1,highlightbackground=BORDER)
+        out.pack(fill="both",expand=True,padx=16,pady=(4,12))
+        def say(txt):
+            out.config(state="normal"); out.delete("1.0","end"); out.insert("1.0",txt); out.config(state="disabled")
+        last=meta_get(MONDAY_META_LAST,"")
+        try: say("Last Monday import:\n\n"+monday_summary_text(json.loads(last))) if last else say("No Monday import has run yet.")
+        except Exception: say("No Monday import has run yet.")
+        def need_folder():
+            save()
+            if not cfg.get("folder") or not os.path.isdir(cfg["folder"]):
+                messagebox.showwarning("Pick the folder","Choose the folder the weekly wages file is saved into first.",parent=d); return True
+            return False
+        def schedule_on():
+            if need_folder(): return
+            try:
+                self._schtasks(["/Create","/F","/SC","WEEKLY","/D","MON","/ST",cfg.get("time","10:00"),
+                                "/TN",self.MONDAY_TASK_NAME,"/TR",self._monday_command()])
+            except Exception as exc:
+                messagebox.showerror("Couldn't schedule it",str(exc),parent=d); return
+            cfg["enabled"]=True; save_monday_cfg(cfg); show_state()
+            messagebox.showinfo("Scheduled",f"Done — every Monday at {cfg.get('time')} this PC will run the import.\n\n"
+                                "Tip: press 'Test the schedule now' once to check it works.",parent=d)
+        def schedule_off():
+            try: self._schtasks(["/Delete","/F","/TN",self.MONDAY_TASK_NAME])
+            except Exception as exc:
+                if os.name=="nt" and "cannot find" not in str(exc).lower():
+                    messagebox.showerror("Couldn't remove the schedule",str(exc),parent=d); return
+            cfg["enabled"]=False; save_monday_cfg(cfg); show_state()
+        def test_schedule():
+            try: self._schtasks(["/Run","/TN",self.MONDAY_TASK_NAME])
+            except Exception as exc:
+                messagebox.showerror("Couldn't start it",str(exc),parent=d); return
+            say("Started the scheduled import in the background.\nWait a minute, then reopen this window (or restart the app) to see the result.\n"
+                f"Details are written to monday_auto.log in {_data_folder()}.")
+        def preview():
+            if need_folder(): return
+            say("Checking the folder…")
+            self._run_off_ui(lambda:monday_run(cfg["folder"],user=self.user,dry_run=True),
+                             lambda sm:say(("PREVIEW — nothing has been saved.\n\n"+monday_summary_text(sm)+_monday_skip_detail(sm)) if sm.get("status")=="done"
+                                           else monday_summary_text(sm)),
+                             lambda exc:say(f"Couldn't check the folder: {exc}"))
+        def run_now():
+            if need_folder(): return
+            if not messagebox.askyesno("Run the Monday import now?","Import the newest new wages file from the folder now?\n\n"
+                                       "Tip: use Preview first. Everything it adds can be removed with Undo.",parent=d): return
+            say("Importing…")
+            def ok(sm):
+                say(monday_summary_text(sm)+_monday_skip_detail(sm))
+                if sm.get("status")=="done":
+                    self._monday_seen(sm.get("when")); self.refresh()
+            self._background_job(lambda:monday_run(cfg["folder"],user=self.user),ok,
+                                 lambda exc:say(f"The import failed — nothing was half-saved.\n\n{exc}"),sync_after=True,label="monday_run")
+        for txt,cmd,col in [("👁  Preview",preview,SECONDARY),("▶  Run now",run_now,PRIMARY),("📅  Turn on every Monday",schedule_on,SUCCESS),
+                            ("Turn off",schedule_off,CONTROL),("Test the schedule now",test_schedule,CONTROL)]:
+            mkbtn(btns,txt,cmd,col,fg=("#fff" if col in (SECONDARY,PRIMARY,SUCCESS) else TEXT)).pack(side="left",padx=(0,8))
+        show_state()
+
+    def _monday_seen(self,when):
+        cfg=load_monday_cfg(); cfg["seen"]=when or ""; 
+        try: save_monday_cfg(cfg)
+        except Exception: pass
+
+    def _monday_banner_check(self):
+        """After a Monday run, show its summary once on this PC."""
+        try:
+            raw=meta_get(MONDAY_META_LAST,"")
+            if not raw: return
+            sm=json.loads(raw)
+            if sm.get("when","")<=load_monday_cfg().get("seen",""): return
+        except Exception:
+            return
+        try:
+            if getattr(self,"_mon_bar",None) is not None: self._mon_bar.destroy()
+        except Exception: pass
+        bar=tk.Frame(self.main,bg=_mix_hex(CARD,CYAN,0.16),highlightbackground=CYAN,highlightthickness=1)
+        first=self.main.winfo_children()[0] if self.main.winfo_children() else None
+        bar.pack(fill="x",before=first) if first is not None and first is not bar else bar.pack(fill="x")
+        self._mon_bar=bar
+        tk.Label(bar,text="📅  "+monday_summary_text(sm).split("\n",2)[0]+"  —  "+(monday_summary_text(sm).split("\n")[1] if "\n" in monday_summary_text(sm) else ""),
+                 fg=TEXT,bg=bar.cget("bg"),font=("Segoe UI Semibold",ui_pt(9),"bold"),anchor="w",justify="left",wraplength=900).pack(side="left",padx=12,pady=6)
+        def close(): self._monday_seen(sm.get("when")); bar.destroy()
+        tk.Button(bar,text="OK",command=close,bg=CONTROL,fg=TEXT,relief="flat",bd=0,cursor="hand2",padx=10,pady=3).pack(side="right",padx=(4,10),pady=4)
+        tk.Button(bar,text="Details",command=lambda:(close(),self.monday_dialog()),bg=CONTROL,fg=TEXT,relief="flat",bd=0,cursor="hand2",padx=10,pady=3).pack(side="right",padx=4,pady=4)
+        tk.Button(bar,text="↶ Undo it",command=lambda:(close(),self.remove_auto_dialog(source="Monday auto-import",only_last=True)),
+                  bg=CONTROL,fg=TEXT,relief="flat",bd=0,cursor="hand2",padx=10,pady=3).pack(side="right",padx=4,pady=4)
+
     def _update_restart(self):
         L=_ap_launcher()
         if L is None: return
@@ -7407,56 +7540,8 @@ class App:
     _CMV_SKIP_STATUS=("rejected","cancelled","canceled","declined")
 
     def _roster_cmv_ghosts(self,wk):
-        """CareMile shifts this week that no allocation covers yet.
-
-        CareMile (CMV Week Info) is what was really worked; an allocation is what has been
-        reconciled. Per worker + day + CareMile client, the hours already allocated to a
-        matching app client are used up shift by shift (earliest first); whatever is left
-        uncovered comes back as a 'ghost' the roster draws dashed. Rejected/cancelled
-        sessions are ignored, exactly as the CareMile import ignores them."""
-        clients=list(self._snapshot.get("clients",[]))
-        alloc=[r for r in self._week_rows() if r[8] in _DAY_NAMES]
-        mapped={}
-        def app_client(raw):
-            if raw not in mapped:
-                mapped[raw]=next((c for c in clients if cmv_client_match(raw,c)),None)
-            return mapped[raw]
-        groups={}
-        for x in self._snapshot.get("cmv_info",[]) or []:
-            try:
-                rid,rwk,w,src,wd,day,raw,service,hours,st,et,status=x[:12]
-            except Exception:
-                continue
-            if rwk!=wk or day not in _DAY_NAMES or not w: continue
-            if str(status or "").strip().lower() in self._CMV_SKIP_STATUS: continue
-            try: hours=float(hours or 0)
-            except Exception: hours=0.0
-            if hours<=0.01: continue
-            groups.setdefault((w,day,_norm_name(str(raw).split("-")[0])),[]).append((rid,w,day,raw,hours,st or "",et or ""))
-        ghosts=[]
-        for (w,day,_k),items in groups.items():
-            raw0=items[0][3]
-            mine=[r for r in alloc if r[2]==w and r[8]==day and cmv_client_match(raw0,r[3])]
-            have=sum(float(r[5] or 0) for r in mine)
-            ends=[normalize_time(r[13]) for r in mine if _hhmm(normalize_time(r[13] or "")) is not None]
-            last_end=max(ends,key=_hhmm) if ends else ""
-            items.sort(key=lambda t:(_hhmm(t[5]) if _hhmm(t[5]) is not None else 9999,t[0]))
-            for rid,w_,day_,raw,hours,st,et in items:
-                if have>=hours-0.01:
-                    have-=hours; continue
-                need=round(hours-max(0.0,have),2); partial=have>0.01; have=0.0
-                cat=_CAT_OF_DAY.get(day_,"Weekday")
-                gs,ge=st,et
-                if partial:
-                    # The allocated part already fills the start of the shift, so the rest
-                    # starts where the last matching allocation ends (never on top of it).
-                    gs=last_end
-                    span=hours_between(gs,normalize_time(et)) if (gs and et) else None
-                    ge=normalize_time(et) if (span is not None and abs(span-need)<0.02) else ""
-                ghosts.append({"id":rid,"worker":w_,"day":day_,"raw":raw,"client":app_client(raw),
-                               "hours":need,"start":gs,"end":ge,"category":cat,"partial":partial,
-                               "shift":(f"{st}–{et}" if st and et else (st or ""))})
-        return ghosts
+        """CareMile shifts this week that no allocation covers yet (see cmv_uncovered_shifts)."""
+        return cmv_uncovered_shifts(self._snapshot,wk,self._week_rows())
 
     def _roster_open_add(self,prefill,source):
         """Open Add Allocation already filled in from the roster."""
@@ -9551,13 +9636,14 @@ class App:
         d,body=branded_dialog(self.root,"Settings & Tools","Imports and specialist tools — everyday editing stays in its main screen",720,500)
         grid=tk.Frame(body,bg=BG_DARK); grid.pack(fill="both",expand=True,padx=20,pady=18)
         items=[("Import Payroll",self.payroll_import_dialog),("Import Shift CSV",self.shift_import_dialog),("⧉ Copy week…",self.copy_week_dialog),
-               ("↶ Undo a copy / auto allocation…",self.remove_auto_dialog),("Worker Chains",self.chains_dialog),("Users",self.users_dialog)]
+               ("↶ Undo a copy / auto allocation…",self.remove_auto_dialog),("📅 Monday auto-import…",self.monday_dialog),
+               ("Worker Chains",self.chains_dialog),("Users",self.users_dialog)]
         if self.role=="manager": items.append((f"⇪ Publish update…   (running {APP_VERSION})",self.publish_update_dialog))
         for i,(label,cmd) in enumerate(items):
             b=tk.Button(grid,text=label,command=cmd,bg=CARD,fg=TEXT,font=("Segoe UI Semibold",10),relief="flat",bd=0,cursor="hand2",padx=15,pady=18,activebackground=HOVER,activeforeground=TEXT,highlightbackground=BORDER,highlightthickness=1)
             b.grid(row=i//2,column=i%2,sticky="nsew",padx=7,pady=7)
         for i in range(2): grid.grid_columnconfigure(i,weight=1)
-        for i in range(3): grid.grid_rowconfigure(i,weight=1)
+        for i in range((len(items)+1)//2): grid.grid_rowconfigure(i,weight=1)
         tk.Label(body,text="Period switching / rename / archive / delete: click the PERIOD button at the top.\nWeek dates: click the date badge beside the period (or Edit weeks inside Period Manager).",
                  fg=TEXT2,bg=BG_DARK,font=("Segoe UI",9),justify="left").pack(anchor="w",padx=22,pady=(0,16))
 
@@ -11200,9 +11286,10 @@ class App:
         if n=="auto-chain": return "Auto Allocate (Chain)"
         if n.startswith("Copied from"): return "Copy week"
         if n=="From payroll": return "Copy week (payroll)"
+        if n.startswith("Monday auto"): return "Monday auto-import"
         return None
 
-    def remove_auto_dialog(self):
+    def remove_auto_dialog(self,source=None,only_last=False):
         d,body=branded_dialog(self.root,"Remove Auto & Copied Allocations",
             "Undo what the app added for you: Auto Allocate, Auto Allocate (Chain) and Copy week. Shifts typed by hand are never listed here.",
             900,700)
@@ -11210,12 +11297,12 @@ class App:
         def mkf(lbl,var,vals,w):
             tk.Label(top,text=lbl,fg=TEXT,bg=BG_DARK,font=FONTB).pack(side="left")
             ttk.Combobox(top,textvariable=var,values=vals,state="readonly",width=w).pack(side="left",padx=(6,16))
-        fsrc=tk.StringVar(value="(Anything automatic)"); fwk=tk.StringVar(value="(All weeks)"); fcli=tk.StringVar(value="(All clients)")
-        mkf("Made by:",fsrc,["(Anything automatic)","Copy week","Auto Allocate","Auto Allocate (Chain)"],22)
+        fsrc=tk.StringVar(value=source or "(Anything automatic)"); fwk=tk.StringVar(value="(All weeks)"); fcli=tk.StringVar(value="(All clients)")
+        mkf("Made by:",fsrc,["(Anything automatic)","Monday auto-import","Copy week","Auto Allocate","Auto Allocate (Chain)"],22)
         mkf("Week:",fwk,["(All weeks)"]+WEEKS,12)
         mkf("Client:",fcli,["(All clients)"]+list(self._snapshot.get("clients",[])),20)
-        lastv=tk.BooleanVar(value=False)
-        tk.Checkbutton(top,text="Only the last copy",variable=lastv,fg=TEXT,bg=BG_DARK,selectcolor=BG_LIGHT,
+        lastv=tk.BooleanVar(value=bool(only_last))
+        tk.Checkbutton(top,text="Only the last copy / Monday run",variable=lastv,fg=TEXT,bg=BG_DARK,selectcolor=BG_LIGHT,
                        activebackground=BG_DARK,activeforeground=TEXT,font=FONT,command=lambda:build_preview()).pack(side="left")
 
         tk.Label(body,text="Preview — allocations that will be REMOVED:",fg=DANGER,bg=BG_DARK,font=FONTB).pack(anchor="w",padx=16,pady=(6,2))
@@ -11239,10 +11326,12 @@ class App:
                 if cli_f not in ("","(All clients)") and r[3]!=cli_f: continue
                 rows.append((r,src))
             if lastv.get():
-                # A copy saves all its shifts in one go, so they share the same "added" time.
-                copies=[r for r,src in rows if src.startswith("Copy week")]
+                # A copy (or a Monday run) saves all its shifts in one go, so they share
+                # the same "added" time: keep only the newest such batch.
+                batch=lambda s_:s_.startswith("Copy week") or s_=="Monday auto-import"
+                copies=[r for r,src in rows if batch(src)]
                 last=max((str(r[11] or "")[:19] for r in copies),default="")
-                rows=[(r,src) for r,src in rows if src.startswith("Copy week") and str(r[11] or "")[:19]==last]
+                rows=[(r,src) for r,src in rows if batch(src) and str(r[11] or "")[:19]==last]
             matches_holder[0]=[r for r,_s in rows]
             wl={wk:week_label_short(wk) for wk in WEEKS}
             def when(c):
@@ -18744,6 +18833,343 @@ def _rev_invoices_tab(wb,R,snames,inv_of,cellpos):
         r_+=2
 
 
+# ======================================================================================
+# CAREMILE: shifts that no allocation covers yet
+# ======================================================================================
+_CMV_SKIP_STATUSES=("rejected","cancelled","canceled","declined")
+
+def cmv_resolve_client(raw,clients):
+    """The ONE app client a CareMile client name stands for, or None when unsure.
+
+    Strongest evidence first: the full name (before '-CO-…') equal to, or starting, an
+    app client's name. Only if nothing like that exists is the loose first-name match of
+    cmv_client_match used — and then only when exactly one client fits. Two clients that
+    both fit (two 'Sarah's) is ambiguous: None, so a person decides instead of a guess."""
+    key=lambda t:re.sub(r"[^a-z0-9]","",str(t or "").lower())     # digits kept: "Unit 5" ≠ "Unit 15"
+    full=key(str(raw).split("-")[0])
+    if not full: return None
+    exact=[c for c in clients if key(c)==full]
+    if len(exact)==1: return exact[0]
+    if len(exact)>1: return None
+    pref=[c for c in clients if key(c) and (full.startswith(key(c)) or key(c).startswith(full))]
+    if len(pref)==1: return pref[0]
+    if len(pref)>1: return None
+    loose=[c for c in clients if cmv_client_match(raw,c)]
+    return loose[0] if len(loose)==1 else None
+
+def cmv_uncovered_shifts(snap,wk,week_rows=None):
+    """CareMile shifts in week wk that no allocation covers yet.
+
+    CareMile (CMV Week Info) is what was really worked; an allocation is what has been
+    reconciled. Per worker + day + CareMile client, the hours already allocated to a
+    matching app client are used up shift by shift (earliest first); whatever is left
+    uncovered comes back. Rejected/cancelled sessions are ignored, exactly as the
+    CareMile import ignores them. Used by the roster (dashed blocks) and the Monday run."""
+    clients=list(snap.get("clients",[]))
+    if week_rows is None: week_rows=[r for r in snap.get("allocations",[]) if r[1]==wk]
+    alloc=[r for r in week_rows if r[8] in _DAY_NAMES]
+    mapped={}
+    def app_client(raw):
+        if raw not in mapped: mapped[raw]=cmv_resolve_client(raw,clients)
+        return mapped[raw]
+    groups={}
+    for x in snap.get("cmv_info",[]) or []:
+        try:
+            rid,rwk,w,src,wd,day,raw,service,hours,st,et,status=x[:12]
+        except Exception:
+            continue
+        if rwk!=wk or day not in _DAY_NAMES or not w: continue
+        if str(status or "").strip().lower() in _CMV_SKIP_STATUSES: continue
+        try: hours=float(hours or 0)
+        except Exception: hours=0.0
+        if hours<=0.01: continue
+        groups.setdefault((w,day,_norm_name(str(raw).split("-")[0])),[]).append((rid,w,day,raw,hours,st or "",et or "",wd))
+    ghosts=[]
+    for (w,day,_k),items in groups.items():
+        raw0=items[0][3]; target=app_client(raw0)
+        # Covered only by allocations to THE client this CareMile name resolves to; when it
+        # can't be resolved, fall back to the loose match so nothing is shown twice.
+        mine=[r for r in alloc if r[2]==w and r[8]==day and (r[3]==target if target else cmv_client_match(raw0,r[3]))]
+        have=sum(float(r[5] or 0) for r in mine)
+        ends=[normalize_time(r[13]) for r in mine if _hhmm(normalize_time(r[13] or "")) is not None]
+        last_end=max(ends,key=_hhmm) if ends else ""
+        items.sort(key=lambda t:(_hhmm(t[5]) if _hhmm(t[5]) is not None else 9999,t[0] if t[0] is not None else 0))
+        for rid,w_,day_,raw,hours,st,et,wd in items:
+            if have>=hours-0.01:
+                have-=hours; continue
+            need=round(hours-max(0.0,have),2); partial=have>0.01; have=0.0
+            cat=_CAT_OF_DAY.get(day_,"Weekday")
+            gs,ge=st,et
+            if partial:
+                # The allocated part already fills the start of the shift, so the rest
+                # starts where the last matching allocation ends (never on top of it).
+                gs=last_end
+                span=hours_between(gs,normalize_time(et)) if (gs and et) else None
+                ge=normalize_time(et) if (span is not None and abs(span-need)<0.02) else ""
+            ghosts.append({"id":rid,"worker":w_,"day":day_,"raw":raw,"client":app_client(raw),"date":str(wd or "")[:10],
+                           "hours":need,"start":gs,"end":ge,"category":cat,"partial":partial,
+                           "shift":(f"{st}–{et}" if st and et else (st or ""))})
+    return ghosts
+
+# ======================================================================================
+# MONDAY AUTO-IMPORT
+# Every Monday (Windows Task Scheduler runs "ALLOCATE_PRO --monday-run"), or on demand
+# from Settings & Tools: pick up the newest weekly wages file from a shared folder,
+# import it into the right week, allocate the CareMile shifts, then copy last week.
+# Safety rules, because nobody is watching:
+#   • a file is processed once; a week that already has wages is never imported again;
+#   • nobody is ever put over their pay;
+#   • names or clients it can't match are skipped and listed, never guessed or created;
+#   • everything it adds is noted "Monday auto …" so Undo removes it in one go.
+# ======================================================================================
+MONDAY_NOTE_CMV="Monday auto · CareMile"
+MONDAY_NOTE_COPY="Monday auto · copied from "
+MONDAY_META_LAST="monday_auto_last"
+MONDAY_META_DONE="monday_auto_done_files"
+
+def _monday_cfg_path(): return os.path.join(_data_folder(),"monday_auto.json")
+
+def load_monday_cfg():
+    cfg={"folder":"","enabled":False,"time":"10:00"}
+    try:
+        with open(_monday_cfg_path(),"r",encoding="utf-8") as fh: cfg.update(json.load(fh) or {})
+    except Exception: pass
+    return cfg
+
+def save_monday_cfg(cfg):
+    with open(_monday_cfg_path(),"w",encoding="utf-8") as fh: json.dump(cfg,fh,indent=1)
+
+def _monday_log(msg):
+    try:
+        with open(os.path.join(_data_folder(),"monday_auto.log"),"a",encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='seconds')}  {msg}\n")
+    except Exception: pass
+
+def _file_fingerprint(path):
+    h=hashlib.sha1()
+    with open(path,"rb") as fh:
+        for chunk in iter(lambda:fh.read(1<<20),b""): h.update(chunk)
+    return h.hexdigest()
+
+def _monday_candidates(folder):
+    try: names=os.listdir(folder)
+    except Exception: return []
+    files=[os.path.join(folder,n) for n in names if n.lower().endswith(".xlsx") and not n.startswith("~$")]
+    return sorted(files,key=lambda p:os.path.getmtime(p),reverse=True)
+
+def _ph_category(wk,day,cat):
+    """Public Holiday when that day of week wk is a Victorian public holiday."""
+    try: dd=day_date_for(parse_week_date(get_week_date(wk)),day) if day else None
+    except Exception: dd=None
+    if dd and dd in REV_VIC_PH: return "Public Holiday"
+    if cat=="Public Holiday": return _CAT_OF_DAY.get(day,"Weekday")
+    return cat
+
+def monday_plan(path,snap=None):
+    """Work out everything the Monday run would do with one file, without saving.
+    Returns a plan dict; plan["status"] is "ready" or the reason it stopped."""
+    snap=snap if snap is not None else load_period_snapshot()
+    plan={"file":os.path.basename(path),"path":path,"status":"ready","week":None,"wages":[],"source_rows":[],
+          "unmatched_workers":[],"cmv_rows":[],"copy_rows":[],"skipped":{},"kind":""}
+    def skip(reason,item):
+        plan["skipped"].setdefault(reason,[]).append(item)
+    workers=list(snap.get("workers",[]))
+    def match_worker(name):
+        m,_r=fuzzy_match(name,workers)
+        if m: return m
+        first=[w for w in workers if w.lower().split()[0:1]==name.lower().split()[0:1]]
+        return first[0] if len(first)==1 else None
+    cmv=parse_caremile_weekly_wage_file(path)
+    if cmv is not None:
+        plan["kind"]="CareMile weekly wages"
+        d_end=parse_week_date(cmv.get("date_end","")) or parse_week_date(cmv.get("date_start",""))
+        wk=week_for_date(d_end) if d_end else None
+        if not wk:
+            plan["status"]=(f"its dates ({cmv.get('date_start','?')} – {cmv.get('date_end','?')}) aren't in the open period" if d_end
+                            else "the file has no shift dates, so its week can't be worked out safely"); return plan
+        plan["week"]=wk
+        for entry in cmv.get("wages",[]):
+            src=entry["source_worker"]; amt=float(entry["amount"])
+            target=match_worker(src)
+            if not target: plan["unmatched_workers"].append(f"{src} (${fmt(amt)})"); continue
+            plan["wages"].append((target,wk,amt))
+            for rr in _cmv_rows_for_source(src,cmv.get("sessions",[])):
+                plan["source_rows"].append({'week':wk,'worker':target,'source_worker':rr.get('source_worker',src),
+                    'work_date':rr.get('date',''),'day':rr.get('day',''),'client':rr.get('client',''),'service':rr.get('service',''),
+                    'hours':rr.get('hours',0),'start_time':rr.get('start_time',''),'end_time':rr.get('end_time',''),
+                    'status':rr.get('status',''),'source_note':rr.get('note',''),'source_file':cmv.get('source_file',os.path.basename(path))})
+    else:
+        try: companies,blocks=parse_payroll_file(path)
+        except Exception: companies,blocks=[],[]
+        dated=[b for b in blocks if b.get("date") and week_for_date(b["date"])]
+        if not dated:
+            plan["status"]="not a weekly wages file this app can place in a week automatically"; return plan
+        b=max(dated,key=lambda b:b["date"]); wk=week_for_date(b["date"])
+        comp=next((c for c in companies if c.lower()=="cmv"),companies[0] if companies else None)
+        plan["kind"]=f"payroll file ({comp})"; plan["week"]=wk
+        for name,vals in b.get("rows",[]):
+            amt=float(vals.get(comp,0.0) or 0.0)
+            if amt<=1e-9: continue
+            target=match_worker(name)
+            if not target: plan["unmatched_workers"].append(f"{name} (${fmt(amt)})"); continue
+            plan["wages"].append((target,wk,amt))
+    wk=plan["week"]
+    if sum(float(v or 0) for (w,k),v in snap.get("wages",{}).items() if k==wk)>0.01:
+        plan["status"]=f"{wk} already has wages — it's never imported twice"; return plan
+    if not plan["wages"]:
+        plan["status"]="no worker in the file matched a worker in the app"; return plan
+
+    # ---- what the week will look like after this import (in memory only) ----
+    wages=dict(snap.get("wages",{})); wages.update({(w,k):a for w,k,a in plan["wages"]})
+    cmv_info=[x for x in snap.get("cmv_info",[]) if not (x[1]==wk and x[2] in {r["worker"] for r in plan["source_rows"]})]
+    cmv_info+=[(None,r["week"],r["worker"],r["source_worker"],r["work_date"],r["day"],r["client"],r["service"],r["hours"],
+                r["start_time"],r["end_time"],r["status"]) for r in plan["source_rows"]]
+    view=dict(snap,wages=wages,cmv_info=cmv_info)
+    wrates=snap.get("worker_rates",{}) or {}
+    week_rows=[r for r in snap.get("allocations",[]) if r[1]==wk]
+    used={}
+    for r in week_rows: used[r[2]]=used.get(r[2],0.0)+float(r[7] or 0)
+    busy={}                         # (worker, day) -> [(a,b)] ; (client, day) -> [(a,b)]
+    def span(st,et):
+        a=_hhmm(normalize_time(st or "")); b=_hhmm(normalize_time(et or ""))
+        if a is None or b is None: return None
+        return (a,b+1440) if b<=a else (a,b)
+    for r in week_rows:
+        sp=span(r[12],r[13])
+        if sp and r[8]: busy.setdefault(("w",r[2],r[8]),[]).append(sp); busy.setdefault(("c",r[3],r[8]),[]).append(sp)
+    have={(r[2],r[3],r[8]) for r in week_rows}
+    def clash(w,c,day,sp):
+        if not sp or not day: return False
+        for a,b in busy.get(("w",w,day),[])+busy.get(("c",c,day),[]):
+            if sp[0]<b and a<sp[1]: return True
+        return False
+    def afford(w,cat,hours):
+        try: rate=effective_rate(w,cat,wrates,week=wk)
+        except Exception: rate=GLOBAL_RATES.get(cat,0)
+        cost=hours*rate
+        if used.get(w,0.0)+cost>wages.get((w,wk),0.0)+0.01: return None
+        return cost
+    def take(w,c,day,sp,cost):
+        used[w]=used.get(w,0.0)+cost; have.add((w,c,day))
+        if sp: busy.setdefault(("w",w,day),[]).append(sp); busy.setdefault(("c",c,day),[]).append(sp)
+
+    # 1) CareMile shifts first — the work that really happened
+    imported={w for w,_k,_a in plan["wages"]}
+    for g in cmv_uncovered_shifts(view,wk,week_rows):
+        if g["worker"] not in imported: continue
+        label=f"{g['worker']} → {g['raw']} {g['day'][:3]} {g['shift'] or ''} {fmt(g['hours'])}h"
+        if not g["client"]: skip("CareMile client not in your client list",label); continue
+        cat=_ph_category(wk,g["day"],g["category"]); sp=span(g["start"],g["end"])
+        if clash(g["worker"],g["client"],g["day"],sp): skip("would clash with another shift",label); continue
+        cost=afford(g["worker"],cat,g["hours"])
+        if cost is None: skip("would put the worker over their pay",label); continue
+        plan["cmv_rows"].append((wk,g["worker"],g["client"],cat,g["hours"],g["day"],MONDAY_NOTE_CMV,g["start"],g["end"]))
+        take(g["worker"],g["client"],g["day"],sp,cost)
+
+    # 2) then last week's shifts, for whatever pay is still left
+    i=WEEKS.index(wk)
+    if i==0:
+        plan["skipped"].setdefault("last week is in the previous period — nothing copied",[]).append(wk)
+    else:
+        prev=WEEKS[i-1]
+        src=sorted([r for r in snap.get("allocations",[]) if r[1]==prev and float(r[5] or 0)>0 and r[8] in _DAY_NAMES],
+                   key=lambda r:(DAY_OFFSET.get(r[8],9),r[12] or "",r[2]))
+        for r in src:
+            w,c,cat,h,day=r[2],r[3],r[4],float(r[5] or 0),r[8]
+            label=f"{w} → {c} {day[:3]} {(r[12] or '')+('–'+r[13] if r[13] else '')} {fmt(h)}h"
+            if w not in workers: continue
+            if wages.get((w,wk),0.0)<=0.01: skip(f"worker not paid in {wk} (not in this wages file)",label); continue
+            if (w,c,day) in have: skip("already has this worker for this client that day",label); continue
+            cat=_ph_category(wk,day,cat); sp=span(r[12],r[13])
+            if clash(w,c,day,sp): skip("would clash with another shift",label); continue
+            cost=afford(w,cat,h)
+            if cost is None: skip("would put the worker over their pay",label); continue
+            plan["copy_rows"].append((wk,w,c,cat,h,day,MONDAY_NOTE_COPY+prev,r[12] or "",r[13] or ""))
+            take(w,c,day,sp,cost)
+    plan["paid"]=sum(a for _w,_k,a in plan["wages"])
+    plan["left"]=sum(max(0.0,wages.get((w,wk),0.0)-used.get(w,0.0)) for w in imported)
+    return plan
+
+def monday_summary_text(sm):
+    if sm.get("status")!="done":
+        return f"Monday import: nothing imported — {sm.get('status')}" + (f"  ({sm.get('file')})" if sm.get("file") else "")
+    lines=[f"Monday import done · {sm['week']} · {sm['file']}",
+           f"Paid ${fmt(sm['paid'])} to {sm['workers']} worker(s) · allocated {sm['cmv_n']} CareMile shift(s) ({fmt(sm['cmv_h'])}h)"
+           f" + {sm['copy_n']} copied from last week ({fmt(sm['copy_h'])}h) · ${fmt(sm['left'])} still to allocate"]
+    if sm.get("unmatched"): lines.append(f"⚠ {len(sm['unmatched'])} name(s) in the file need matching by hand: "+", ".join(sm["unmatched"][:6])+("…" if len(sm["unmatched"])>6 else ""))
+    for reason,n in (sm.get("skipped") or {}).items(): lines.append(f"· {n} skipped — {reason}")
+    return "\n".join(lines)
+
+def _monday_skip_detail(sm):
+    det=sm.get("skipped_detail") or {}
+    if not det: return ""
+    out=["","","What was skipped (first few of each):"]
+    for reason,items in det.items():
+        out.append(f"• {reason}:")
+        out+= [f"    {x}" for x in items[:8]]
+    return "\n".join(out)
+
+def monday_run(folder=None,user="Monday auto",dry_run=False,log=None):
+    """Find the newest new wages file in `folder` and process it. Returns a summary dict."""
+    log=log or _monday_log
+    folder=folder or load_monday_cfg().get("folder","")
+    sm={"status":"","when":datetime.now().isoformat(timespec="seconds"),"file":""}
+    if not folder or not os.path.isdir(folder):
+        sm["status"]="the wages folder isn't set or can't be reached"; log(sm["status"]); return sm
+    try: done=set(json.loads(meta_get(MONDAY_META_DONE,"[]") or "[]"))
+    except Exception: done=set()
+    snap=load_period_snapshot(); plan=None
+    for path in _monday_candidates(folder):
+        try: fp=_file_fingerprint(path)
+        except Exception: continue
+        if fp in done: continue
+        p=monday_plan(path,snap)
+        if p["status"]=="not a weekly wages file this app can place in a week automatically": continue
+        plan=p; plan["fp"]=fp; break
+    if plan is None:
+        sm["status"]="no new wages file in the folder"; log(sm["status"]); return sm
+    sm.update(file=plan["file"],week=plan["week"],kind=plan["kind"])
+    if plan["status"]!="ready":
+        sm["status"]=plan["status"]; log(f"{plan['file']}: {plan['status']}")
+        if not dry_run and "already has wages" in plan["status"]:
+            _monday_mark_done(plan["fp"],done)
+        return sm
+    rows=plan["cmv_rows"]+plan["copy_rows"]
+    sm.update(status="done",paid=plan["paid"],workers=len(plan["wages"]),unmatched=plan["unmatched_workers"],
+              cmv_n=len(plan["cmv_rows"]),cmv_h=sum(r[4] for r in plan["cmv_rows"]),
+              copy_n=len(plan["copy_rows"]),copy_h=sum(r[4] for r in plan["copy_rows"]),left=plan["left"],
+              skipped={k:len(v) for k,v in plan["skipped"].items()},skipped_detail={k:v[:40] for k,v in plan["skipped"].items()},
+              dry_run=bool(dry_run))
+    if dry_run: return sm
+    save_cmv_week_import_batch([],plan["wages"],plan["source_rows"],user) if plan["source_rows"] or plan["kind"].startswith("CareMile") \
+        else save_payroll_import_batch([],plan["wages"],{},user)
+    if rows: save_allocations_batch(rows,user)
+    _monday_mark_done(plan["fp"],done)
+    try: meta_set(MONDAY_META_LAST,json.dumps(sm))
+    except Exception: pass
+    log(monday_summary_text(sm).replace("\n"," | "))
+    return sm
+
+def _monday_mark_done(fp,done):
+    done=list(done)+[fp]
+    try: meta_set(MONDAY_META_DONE,json.dumps(done[-60:]))
+    except Exception: pass
+
+def monday_headless():
+    """Entry point for Task Scheduler: no window, log to monday_auto.log."""
+    try:
+        _bootstrap_database_worker()
+        if STARTUP_ERROR: _monday_log(f"could not open the database: {STARTUP_ERROR}"); return 2
+        sm=monday_run(user="Monday auto")
+        if CLOUD_ENABLED:
+            try: sync_cloud_now(wait=True)
+            except Exception: pass
+        return 0 if sm.get("status") in ("done","no new wages file in the folder") else 1
+    except Exception:
+        import traceback
+        _monday_log("FAILED: "+traceback.format_exc().replace("\n"," | "))
+        return 3
+
 def main():
     # FAST START: show login before any cloud/database bootstrap.
     root=tk.Tk()
@@ -18759,6 +19185,8 @@ def main():
     sys.excepthook=lambda et,e,tb:_log_error("uncaught",(et,e,tb))
     def start(username,role):
         root.deiconify(); app=App(root,username,role)
+        try: root.after(2500,app._monday_banner_check)
+        except Exception: pass
         try: app._update_start_checks()
         except Exception: pass
         try: root.after(300000,app._archive_index_tick)
@@ -18777,4 +19205,6 @@ def main():
 if __name__=="__main__":
     if "--ap-cloud-child" in sys.argv:
         exec(CLOUD_CHILD_SRC,{"__name__":"__ap_cloud_child__"}); sys.exit(0)
+    if "--monday-run" in sys.argv:
+        sys.exit(monday_headless())
     main()
