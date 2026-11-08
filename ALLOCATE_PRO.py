@@ -9,7 +9,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 import sqlite3, hashlib, os, secrets, csv, json, gzip, re, urllib.request, urllib.error, uuid, socket, time, threading, queue, zipfile, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-APP_VERSION = "12.3.0"
+APP_VERSION = "12.3.1"
 APP_PRODUCT_NAME = "ALLOCATE PRO"
 APP_TAGLINE = "Paid → Reconciled → Remaining"
 
@@ -6095,7 +6095,13 @@ class App:
             if not st["code"]: return
             pub.config(state="disabled",text="Publishing…"); status.config(text="Signing and uploading…",fg=TEXT)
             code=st["code"]; note=notev.get().strip()
-            def work(): return publish_update(code,note,self.user)
+            prog={"t":"Signing and uploading…"}
+            def tick():
+                try:
+                    if pub.cget("text")=="Publishing…": status.config(text=prog["t"],fg=TEXT); d.after(500,tick)
+                except Exception: pass
+            d.after(500,tick)
+            def work(): return publish_update(code,note,self.user,progress=lambda t:prog.__setitem__("t",t))
             def done(v):
                 status.config(text=f"✓ Published {v}. Every PC with the launcher gets a 'Restart now' bar within ~2 minutes (or the next time it opens). This PC is getting it now.",fg=SUCCESS)
                 pub.config(text="Published ✓")
@@ -6104,8 +6110,9 @@ class App:
                     try: self.root.after(3000,self._update_check)
                     except Exception: pass
             def fail(exc):
-                status.config(text=f"Not published: {exc}",fg=DANGER); pub.config(state="normal",text="⇪  Publish to everyone")
-            self._background_job(work,done,fail,label="publish_update")
+                pub.config(state="normal",text="⇪  Publish to everyone"); status.config(text=f"Not published: {exc}",fg=DANGER)
+            # Its own thread, not the save queue: a publish never waits behind a stuck save.
+            self._run_off_ui(work,done,fail)
         pub=mkbtn(body,"⇪  Publish to everyone",go,PRIMARY); pub.pack(anchor="e",padx=20,pady=10); pub.config(state="disabled")
         if path:
             # Opened from the "new version in your Updates folder" banner: file and notes ready.
@@ -17433,8 +17440,10 @@ def _update_schema(con):
     con.execute("""CREATE TABLE IF NOT EXISTS app_update_part(version TEXT, idx INTEGER, data TEXT,
                    PRIMARY KEY(version,idx))""")
 
-def publish_update(code_text,notes="",user="system"):
-    """Sign this ALLOCATE_PRO.py and put it in the cloud. Returns the version published."""
+def publish_update(code_text,notes="",user="system",progress=None,step_timeout=90):
+    """Sign this ALLOCATE_PRO.py and put it in the cloud. Returns the version published.
+    progress(text) is called after each step; a cloud step that hangs longer than
+    step_timeout seconds is abandoned and retried on a fresh connection (12.3.1)."""
     version=code_version(code_text)
     if not version: raise ValueError("That file has no APP_VERSION line — is it ALLOCATE_PRO.py?")
     if "def main():" not in code_text or "class App" not in code_text:
@@ -17458,18 +17467,38 @@ def publish_update(code_text,notes="",user="system"):
         st["con"]=None
         try: _PRIMARY_TLS.conn=None          # a dead cloud stream must not be reused
         except Exception: pass
+    def _step(sql,args):
+        # The cloud call runs on its own thread so a stalled network stream can't block
+        # the publish forever: past step_timeout it is abandoned and the step is retried.
+        box={}
+        def go():
+            try:
+                if st["con"] is None: st["con"]=_master_connect()
+                st["con"].execute(sql,args); st["con"].commit(); box["ok"]=True
+            except Exception as exc:
+                box["err"]=exc
+        t=threading.Thread(target=go,daemon=True); t.start(); t.join(step_timeout)
+        if t.is_alive(): raise TimeoutError(f"the cloud didn't answer within {step_timeout} s")
+        if "err" in box: raise box["err"]
     def run(sql,args=()):
         last=None
         for k in range(5):
             try:
-                if st["con"] is None: st["con"]=_master_connect()
-                st["con"].execute(sql,args); st["con"].commit(); return
+                _step(sql,args); return
             except Exception as exc:
                 last=exc
                 try: st["con"].rollback()
                 except Exception: pass
+                st["con"]=None if isinstance(exc,TimeoutError) else st["con"]
                 _fresh(); time.sleep(min(6,1+2*k))
+                if progress:
+                    try: progress(f"Retrying after a cloud hiccup ({k+1}/5): {exc}")
+                    except Exception: pass
         raise ValueError(f"The cloud didn't accept the update after 5 tries: {last}")
+    def say(t):
+        if progress:
+            try: progress(t)
+            except Exception: pass
     try:
         run("""CREATE TABLE IF NOT EXISTS app_update(version TEXT PRIMARY KEY, created TEXT, published_by TEXT,
                sha256 TEXT, sig TEXT, size INTEGER, parts INTEGER, notes TEXT)""")
@@ -17478,7 +17507,9 @@ def publish_update(code_text,notes="",user="system"):
         run("DELETE FROM app_update WHERE version=?",(version,))          # hide it while the parts change
         run("DELETE FROM app_update_part WHERE version=?",(version,))
         for i,p in enumerate(parts):
+            say(f"Uploading part {i+1} of {len(parts)}…")
             run("INSERT OR REPLACE INTO app_update_part(version,idx,data) VALUES(?,?,?)",(version,i,p))
+        say("Finishing…")
         run("""INSERT OR REPLACE INTO app_update(version,created,published_by,sha256,sig,size,parts,notes)
                VALUES(?,?,?,?,?,?,?,?)""",(version,datetime.now().isoformat(timespec="seconds"),user,sha,sig,len(raw),len(parts),notes or ""))
     finally:
