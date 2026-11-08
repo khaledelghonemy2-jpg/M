@@ -9,7 +9,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 import sqlite3, hashlib, os, secrets, csv, json, gzip, re, urllib.request, urllib.error, uuid, socket, time, threading, queue, zipfile, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-APP_VERSION = "12.3.3"
+APP_VERSION = "12.3.4"
 APP_PRODUCT_NAME = "ALLOCATE PRO"
 APP_TAGLINE = "Paid → Reconciled → Remaining"
 
@@ -7924,6 +7924,10 @@ class App:
         for k in cells: cells[k].sort(key=lambda r:(_hhmm(r[12]) if _hhmm(r[12]) is not None else 9999,r[0]))
         today=datetime.now().date()
         # header
+        body_cv=cv
+        hv=getattr(self,"roster_head",None)
+        if hv is not None and hv.winfo_exists():
+            hv.delete("all"); hv.configure(height=head_h); cv=hv       # header goes on the frozen canvas
         cv.create_rectangle(0,0,W,head_h,fill=TREE_HEADING,outline="")
         cv.create_text(12,head_h/2,text=("CLIENT" if byc else "WORKER"),anchor="w",fill=TEXT2,font=f_chip)
         for i,dn in enumerate(cols):
@@ -7935,9 +7939,14 @@ class App:
             if dd: cv.create_text(x+col_w/2,head_h*0.70,text=dd.strftime("%d %b"),fill=TEXT2,font=f_small)
         cv.create_text(W-tot_w+10,head_h/2,text=("TOTAL · EST LEFT" if byc else "TOTAL · LEFT"),anchor="w",fill=TEXT2,font=f_chip)
         y=head_h
+        if cv is not body_cv:
+            for j in range(len(cols)+1):
+                x=name_w+j*col_w; cv.create_line(x,0,x,head_h,fill=_mix_hex(BG_SOFT,BORDER,.8))
+            cv.create_line(W-tot_w,0,W-tot_w,head_h,fill=_mix_hex(BG_SOFT,BORDER,.8))
+            cv=body_cv; y=0                                            # rows start at the top of the scrolling part
         if not order:
-            cv.create_text(W/2,head_h+60,text=self._alloc_empty_text().replace("\n","  ·  "),fill=TEXT2,font=f_small)
-            cv.configure(height=head_h+120); return
+            cv.create_text(W/2,y+60,text=self._alloc_empty_text().replace("\n","  ·  "),fill=TEXT2,font=f_small)
+            cv.configure(height=y+120); return
         _fit_cache={}
         def fit(text,font,width):
             # Many cards repeat the same text (client names, times): measure each once.
@@ -8707,6 +8716,13 @@ class App:
                                       (180,180,70,70,110,140,120,120),("w","w","c","e","e","w","c","w"),height=19)
         self.alloc_tree._suppress_more_hint=True
         self.roster_area=ScrollArea(host,BG_DARK)
+        # The day/date row is its own canvas ABOVE the scrolling part, so it stays in view
+        # while the workers scroll underneath it.
+        ra=self.roster_area
+        ra.canvas.grid_configure(row=1); ra.vbar.grid_configure(row=1)
+        ra.grid_rowconfigure(0,weight=0); ra.grid_rowconfigure(1,weight=1)
+        self.roster_head=tk.Canvas(ra,bg=BG_SOFT,highlightthickness=1,highlightbackground=BORDER,bd=0,height=ui_px(46))
+        self.roster_head.grid(row=0,column=0,sticky="ew")
         self.roster_canvas=tk.Canvas(self.roster_area.body,bg=BG_SOFT,highlightthickness=1,highlightbackground=BORDER,bd=0,height=200)
         self.roster_canvas.pack(fill="x")
         def _roster_resized(e,self=self):
