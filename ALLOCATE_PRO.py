@@ -9,7 +9,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 import sqlite3, hashlib, os, secrets, csv, json, gzip, re, urllib.request, urllib.error, uuid, socket, time, threading, queue, zipfile, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-APP_VERSION = "12.2.8"
+APP_VERSION = "12.3.0"
 APP_PRODUCT_NAME = "ALLOCATE PRO"
 APP_TAGLINE = "Paid → Reconciled → Remaining"
 
@@ -469,7 +469,11 @@ def _bundled_cloud_token():
         except Exception:
             pass
     return ""
-DEFAULT_TURSO_AUTH_TOKEN = _bundled_cloud_token()
+# Left empty in the shared source (GitHub). The copy that is PUBLISHED through
+# Settings > Publish update carries the key here: Publish fills it in automatically
+# from the publishing PC, so it only ever travels inside your own private, signed update.
+_EMBEDDED_CLOUD_TOKEN = ""
+DEFAULT_TURSO_AUTH_TOKEN = _EMBEDDED_CLOUD_TOKEN or _bundled_cloud_token()
 
 def _load_cloud_config():
     cfg = {}
@@ -485,6 +489,20 @@ def _load_cloud_config():
     return enabled, url, token
 
 CLOUD_ENABLED, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN = _load_cloud_config()
+
+def _remember_cloud_token():
+    """Keep a private copy of the cloud key in this PC's Allocate Pro data folder, so a
+    later version that doesn't carry the key itself still reaches the shared database."""
+    try:
+        if not TURSO_AUTH_TOKEN: return
+        path=os.path.join(_data_folder(),"allocate_pro_cloud_token.txt")
+        if os.path.exists(path):
+            with open(path,"r",encoding="utf-8") as fh:
+                if fh.read().strip()==TURSO_AUTH_TOKEN: return
+        with open(path,"w",encoding="utf-8") as fh: fh.write(TURSO_AUTH_TOKEN+"\n")
+    except Exception:
+        pass
+_remember_cloud_token()
 
 
 # ---------- FAST STARTUP STATE ----------
@@ -6058,6 +6076,10 @@ class App:
             except Exception as exc: messagebox.showerror("Can't read",str(exc),parent=d); return
             v=code_version(code)
             if not v: messagebox.showerror("Not Allocate Pro","That file has no APP_VERSION — choose ALLOCATE_PRO.py.",parent=d); return
+            # A copy from GitHub has no cloud key inside; without it every PC would drop to
+            # local mode after updating. Put this PC's key into the PUBLISHED copy only.
+            if '_EMBEDDED_CLOUD_TOKEN = ""' in code and TURSO_AUTH_TOKEN:
+                code=code.replace('_EMBEDDED_CLOUD_TOKEN = ""',f'_EMBEDDED_CLOUD_TOKEN = "{TURSO_AUTH_TOKEN}"',1)
             st["code"]=code; st["ver"]=v
             newer=(not latest) or version_tuple(v)>version_tuple(latest[0])
             fl.config(text=f"{os.path.basename(p)}  →  version {v}"+("" if newer else "   ⚠ not newer than what's published"),fg=(SUCCESS if newer else WARNING))
