@@ -9,7 +9,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 import sqlite3, hashlib, os, secrets, csv, json, gzip, re, urllib.request, urllib.error, uuid, socket, time, threading, queue, zipfile, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
-APP_VERSION = "12.3.1"
+APP_VERSION = "12.3.2"
 APP_PRODUCT_NAME = "ALLOCATE PRO"
 APP_TAGLINE = "Paid → Reconciled → Remaining"
 
@@ -6067,6 +6067,11 @@ class App:
             if getattr(self,"_update_seen",None):
                 tk.Button(uf,text=f"Restart into {self._update_seen}",command=self._update_restart,bg=SUCCESS,fg="#fff",relief="flat",bd=0,cursor="hand2",padx=8).pack(side="left")
         st={"code":None,"ver":None}
+        autov=tk.BooleanVar(value=auto_update_settings()["on"])
+        def _auto_changed():
+            cfg=load_monday_cfg(); cfg["auto_updates"]=bool(autov.get()); save_monday_cfg(cfg)
+        tk.Checkbutton(info,text="Publish new versions from GitHub automatically (this PC checks every 15 minutes)",variable=autov,command=_auto_changed,
+                       fg=TEXT,bg=BG_DARK,selectcolor=BG_LIGHT,activebackground=BG_DARK,activeforeground=TEXT,font=("Segoe UI",ui_pt(10))).pack(anchor="w",pady=(6,0))
         pickf=tk.Frame(body,bg=BG_DARK); pickf.pack(fill="x",padx=20,pady=8)
         fl=tk.Label(pickf,text="No file chosen",fg=TEXT2,bg=BG_DARK,font=("Segoe UI",ui_pt(9)),anchor="w")
         def pick():
@@ -6149,6 +6154,24 @@ class App:
                 if v and version_tuple(v)>version_tuple(floor) and (best is None or version_tuple(v)>version_tuple(best[0])):
                     best=(v,pth)
         return best
+
+    def _auto_update_tick(self):
+        """Every 15 minutes on the PC that can publish: publish a newer GitHub version."""
+        try: self.root.after(15*60*1000,self._auto_update_tick)
+        except Exception: pass
+        if not update_can_publish() or not auto_update_settings()["on"]: return
+        if getattr(self,"_auto_upd_busy",False): return
+        self._auto_upd_busy=True
+        def done(v):
+            self._auto_upd_busy=False
+            if not v: return
+            self._update_status="checking…"
+            try: self.root.after(3000,self._update_check)
+            except Exception: pass
+        def fail(exc):
+            self._auto_upd_busy=False
+            _update_log(f"auto-update check failed: {exc}")
+        self._run_off_ui(lambda:auto_publish_from_github(user=f"Auto update ({self.user})"),done,fail)
 
     def _update_folder_tick(self):
         """Every few minutes on a PC that can publish: offer a newer version found in the
@@ -17565,6 +17588,40 @@ def publish_update(code_text,notes="",user="system",progress=None,step_timeout=9
         except Exception: pass
     return version
 
+# ---- automatic updates from GitHub (12.3.2) ----
+# The PC that can publish (it holds the signing key) checks this address every 15 minutes.
+# A newer ALLOCATE_PRO.py there is checked, given this PC's cloud key and published to
+# every PC exactly as "Publish update" would. Turn it off in Settings > Publish update.
+AUTO_UPDATE_URL="https://raw.githubusercontent.com/khaledelghonemy2-jpg/M/master/ALLOCATE_PRO.py"
+
+def auto_update_settings():
+    cfg=load_monday_cfg()
+    return {"on":cfg.get("auto_updates",True),"url":cfg.get("auto_update_url") or AUTO_UPDATE_URL}
+
+def fetch_update_source(url,timeout=25):
+    req=urllib.request.Request(url+("&" if "?" in url else "?")+f"nocache={int(time.time())}",headers={"User-Agent":"AllocatePro-updater"})
+    with urllib.request.urlopen(req,timeout=timeout) as r:
+        raw=r.read()
+    return raw.decode("utf-8")
+
+def auto_publish_from_github(user="Auto update",progress=None):
+    """Publish the GitHub version if it is newer than this one and the published one.
+    Returns the version published, or None when there is nothing newer."""
+    st=auto_update_settings()
+    if not st["on"] or not update_can_publish(): return None
+    code=fetch_update_source(st["url"])
+    v=code_version(code)
+    if not v: raise ValueError("the file on GitHub has no APP_VERSION")
+    floor=APP_VERSION
+    latest=latest_published_update()
+    if latest and version_tuple(latest[0])>version_tuple(floor): floor=latest[0]
+    if version_tuple(v)<=version_tuple(floor): return None
+    if '_EMBEDDED_CLOUD_TOKEN = ""' in code and TURSO_AUTH_TOKEN:
+        code=code.replace('_EMBEDDED_CLOUD_TOKEN = ""',f'_EMBEDDED_CLOUD_TOKEN = "{TURSO_AUTH_TOKEN}"',1)
+    publish_update(code,f"Automatic update {v}",user,progress=progress)
+    _update_log(f"auto-published {v} from GitHub")
+    return v
+
 def _launcher_state_repair(ver):
     """12.2.6: this version is running fine, so it must not stay on the launcher's 'bad' list.
     Opening the EXE twice within a few seconds made the 2nd launcher think the 1st one's new
@@ -19869,6 +19926,8 @@ def main():
         try: root.after(2500,app._monday_banner_check)
         except Exception: pass
         try: root.after(6000,app._update_folder_tick)
+        except Exception: pass
+        try: root.after(20000,app._auto_update_tick)
         except Exception: pass
         try: app._update_start_checks()
         except Exception: pass
